@@ -73,7 +73,7 @@ langchain-community       0.3.3
 langchain-core            0.3.12
 langchain-text-splitters  0.3.0
 langsmith                 0.1.136
-llama_cpp_python          0.3.0
+llama_cpp_python          0.3.19
 MarkupSafe                2.1.5
 marshmallow               3.23.0
 matplotlib                3.9.2
