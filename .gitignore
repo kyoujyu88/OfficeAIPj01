@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Models (大容量バイナリはリポジトリに含めない)
+*.gguf
+
+# 環境
+.venv/
+venv/
+.env
