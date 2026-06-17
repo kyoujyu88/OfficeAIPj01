@@ -6,6 +6,9 @@ __pycache__/
 # Models (大容量バイナリはリポジトリに含めない)
 *.gguf
 
+# 会話履歴 (ローカル保存・コミット対象外)
+chat_sessions/
+
 # 環境
 .venv/
 venv/

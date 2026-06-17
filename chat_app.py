@@ -8,6 +8,10 @@
   - llama-cpp-python で GGUF モデルを CPU 推論
   - 生成トークンをストリーミング表示 (生成中に逐次表示)
   - モデル選択 / temperature / max_tokens を UI から調整
+  - 左サイドバーに会話履歴を一覧表示
+      * クリックで過去の会話を再開
+      * チェックを入れて選択した会話をまとめて削除
+  - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ターミナルに動作状況 (状態遷移・性能) をデバッグ出力
 
 備考:
@@ -22,6 +26,7 @@
 
 import os
 import sys
+import json
 import time
 import queue
 import logging
@@ -29,7 +34,7 @@ import threading
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 
 # --------------------------------------------------------------------------
 # 設定
@@ -37,11 +42,17 @@ from tkinter import ttk, scrolledtext
 # モデル (.gguf) を置いているフォルダ。環境変数 LLM_MODELS_DIR で上書き可。
 MODELS_DIR = Path(os.environ.get("LLM_MODELS_DIR", ".")).expanduser()
 
+# 会話履歴 (JSON) の保存先。スクリプトと同じ場所の chat_sessions/ 。
+SESSIONS_DIR = Path(__file__).resolve().parent / "chat_sessions"
+
 # 既定の推論パラメータ (CPU 向けの控えめな値)
 DEFAULT_N_CTX = 4096
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_N_THREADS = os.cpu_count() or 4
+
+# サイドバーのタイトル表示の最大文字数
+TITLE_MAXLEN = 20
 
 # UI がワーカースレッドからの出力を取りに行く間隔 (ミリ秒)
 POLL_INTERVAL_MS = 40
@@ -83,6 +94,48 @@ def discover_models():
         return names
     log.warning("モデルが見つかりません (MODELS_DIR=%s)", MODELS_DIR.resolve())
     return []
+
+
+# --------------------------------------------------------------------------
+# 会話履歴ストア (1 会話 = 1 JSON ファイル)
+# --------------------------------------------------------------------------
+class SessionStore:
+    def __init__(self, base_dir):
+        self.dir = Path(base_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        log.info("[履歴] 保存先: %s", self.dir.resolve())
+
+    def path(self, session_id):
+        return self.dir / f"{session_id}.json"
+
+    def save(self, session):
+        """session: dict(id, title, created, updated, model, messages)"""
+        p = self.path(session["id"])
+        p.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("[履歴] 保存: %s (%s, %d発話)", session["id"], session["title"], len(session["messages"]))
+
+    def load(self, session_id):
+        data = json.loads(self.path(session_id).read_text(encoding="utf-8"))
+        log.info("[履歴] 読み込み: %s (%d発話)", session_id, len(data.get("messages", [])))
+        return data
+
+    def delete(self, session_id):
+        p = self.path(session_id)
+        if p.exists():
+            p.unlink()
+            log.info("[履歴] 削除: %s", session_id)
+
+    def list_meta(self):
+        """一覧用のメタ情報 (id, title, updated) を更新日時の新しい順で返す。"""
+        items = []
+        for p in self.dir.glob("*.json"):
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                items.append({"id": d["id"], "title": d.get("title", "(無題)"), "updated": d.get("updated", 0)})
+            except Exception:
+                log.warning("[履歴] 読み込み失敗: %s", p.name)
+        items.sort(key=lambda x: x["updated"], reverse=True)
+        return items
 
 
 # --------------------------------------------------------------------------
@@ -153,12 +206,20 @@ class ChatApp:
     def __init__(self, root):
         self.root = root
         self.engine = LLMEngine()
+        self.store = SessionStore(SESSIONS_DIR)
+
         self.history = []              # [{"role": ..., "content": ...}]
+        self.current_id = None         # 現在の会話 ID (未保存なら None)
+        self.current_created = None    # 現在の会話の作成時刻
+        self.session_rows = []         # サイドバー行 [(BooleanVar, meta), ...]
+
         self.token_queue = queue.Queue()
         self.generating = False
         self._assistant_buf = ""       # ストリーミング中のアシスタント発話バッファ
 
         self._build_ui()
+        self._refresh_sidebar()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
         log.info(
             "アプリ起動完了 (CPUスレッド=%d, モデルフォルダ=%s)",
@@ -168,16 +229,52 @@ class ChatApp:
     # ---- UI 構築 ---------------------------------------------------------
     def _build_ui(self):
         self.root.title("ローカルLLM チャット (CPU / オフライン)")
-        self.root.geometry("780x620")
-        self.root.minsize(560, 420)
+        self.root.geometry("1000x640")
+        self.root.minsize(720, 460)
+
+        main = ttk.Frame(self.root)
+        main.pack(fill="both", expand=True)
+
+        # ===== 左サイドバー: 会話履歴 =====
+        left = ttk.Frame(main, width=240)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+
+        ttk.Button(left, text="＋ 新規チャット", command=self.on_new_chat).pack(
+            fill="x", padx=6, pady=(8, 4)
+        )
+        ttk.Label(left, text="会話履歴", foreground="#666666").pack(anchor="w", padx=8)
+
+        # スクロール可能なリスト領域 (Canvas + 内部 Frame)
+        list_wrap = ttk.Frame(left)
+        list_wrap.pack(fill="both", expand=True, padx=4, pady=4)
+        self.list_canvas = tk.Canvas(list_wrap, highlightthickness=0, width=224)
+        vsb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.list_canvas.yview)
+        self.list_frame = ttk.Frame(self.list_canvas)
+        self.list_frame.bind(
+            "<Configure>",
+            lambda e: self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all")),
+        )
+        self.list_canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        self.list_canvas.configure(yscrollcommand=vsb.set)
+        self.list_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        ttk.Button(left, text="選択した履歴を削除", command=self.on_delete_selected).pack(
+            fill="x", padx=6, pady=(4, 8)
+        )
+
+        # ===== 右側: チャット本体 =====
+        right = ttk.Frame(main)
+        right.pack(side="left", fill="both", expand=True)
 
         # 上段: モデル選択 + 読み込み + ステータス
-        top = ttk.Frame(self.root, padding=(8, 6))
+        top = ttk.Frame(right, padding=(8, 6))
         top.pack(fill="x")
         ttk.Label(top, text="モデル:").pack(side="left")
         self.model_var = tk.StringVar()
         self.model_combo = ttk.Combobox(
-            top, textvariable=self.model_var, state="readonly", width=46
+            top, textvariable=self.model_var, state="readonly", width=42
         )
         self.model_combo["values"] = discover_models()
         if self.model_combo["values"]:
@@ -190,8 +287,8 @@ class ChatApp:
             side="left", padx=8
         )
 
-        # オプション段: temperature / max_tokens / クリア
-        opt = ttk.Frame(self.root, padding=(8, 0))
+        # オプション段: temperature / max_tokens
+        opt = ttk.Frame(right, padding=(8, 0))
         opt.pack(fill="x")
         ttk.Label(opt, text="temperature:").pack(side="left")
         self.temp_var = tk.DoubleVar(value=DEFAULT_TEMPERATURE)
@@ -203,11 +300,10 @@ class ChatApp:
         ttk.Spinbox(
             opt, from_=16, to=4096, increment=16, width=6, textvariable=self.maxtok_var
         ).pack(side="left", padx=2)
-        ttk.Button(opt, text="会話クリア", command=self.on_clear).pack(side="right")
 
-        # 中段: チャット履歴
+        # 中段: チャット履歴表示
         self.chat = scrolledtext.ScrolledText(
-            self.root, wrap="word", state="disabled", font=("", 11)
+            right, wrap="word", state="disabled", font=("", 11)
         )
         self.chat.pack(fill="both", expand=True, padx=8, pady=6)
         self.chat.tag_config("user", foreground="#1a7f37", font=("", 11, "bold"))
@@ -215,13 +311,105 @@ class ChatApp:
         self.chat.tag_config("system", foreground="#999999", font=("", 9, "italic"))
 
         # 下段: 入力欄 + 送信
-        bottom = ttk.Frame(self.root, padding=(8, 6))
+        bottom = ttk.Frame(right, padding=(8, 6))
         bottom.pack(fill="x")
         self.input = tk.Text(bottom, height=3, wrap="word", font=("", 11))
         self.input.pack(side="left", fill="x", expand=True)
         self.input.bind("<Control-Return>", lambda e: self.on_send())
         self.send_btn = ttk.Button(bottom, text="送信\n(Ctrl+Enter)", command=self.on_send)
         self.send_btn.pack(side="left", padx=4, fill="y")
+
+    # ---- 会話履歴 (サイドバー) ------------------------------------------
+    def _make_title(self):
+        """最初のユーザー発話から会話タイトルを作る。"""
+        for m in self.history:
+            if m["role"] == "user":
+                t = m["content"].strip().replace("\n", " ")
+                return (t[:TITLE_MAXLEN] + "…") if len(t) > TITLE_MAXLEN else t
+        return "新しいチャット"
+
+    def _save_current(self):
+        """現在の会話を保存する (空なら何もしない)。"""
+        if not self.history:
+            return
+        if self.current_id is None:
+            self.current_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+            self.current_created = time.time()
+        self.store.save({
+            "id": self.current_id,
+            "title": self._make_title(),
+            "created": self.current_created,
+            "updated": time.time(),
+            "model": self.engine.model_name,
+            "messages": self.history,
+        })
+
+    def _refresh_sidebar(self):
+        """保存済み会話の一覧を再描画する。"""
+        for child in self.list_frame.winfo_children():
+            child.destroy()
+        self.session_rows = []
+        for meta in self.store.list_meta():
+            row = ttk.Frame(self.list_frame)
+            row.pack(fill="x", pady=1)
+            var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(row, variable=var).pack(side="left")
+            title = meta["title"] or "(無題)"
+            if meta["id"] == self.current_id:
+                title = "▶ " + title          # 現在開いている会話に印
+            ttk.Button(
+                row, text=title, width=22,
+                command=lambda sid=meta["id"]: self.on_load_session(sid),
+            ).pack(side="left", fill="x", expand=True)
+            self.session_rows.append((var, meta))
+
+    def _start_new_session(self):
+        self.history = []
+        self.current_id = None
+        self.current_created = None
+        self.chat.config(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.config(state="disabled")
+
+    def on_new_chat(self):
+        if self.generating:
+            return
+        self._save_current()          # 開いていた会話を保存
+        self._start_new_session()
+        self._refresh_sidebar()
+        self._append_system("新しいチャットを開始しました")
+        log.info("[UI] 新規チャット")
+
+    def on_load_session(self, session_id):
+        """サイドバーの会話をクリック -> 再開。"""
+        if self.generating:
+            return
+        self._save_current()          # 今の会話を保存してから切り替え
+        data = self.store.load(session_id)
+        self.history = data.get("messages", [])
+        self.current_id = data["id"]
+        self.current_created = data.get("created", time.time())
+        self._repaint_chat()
+        self._refresh_sidebar()
+        self.status_var.set(f"会話を再開: {data.get('title', '')}")
+        log.info("[UI] 会話を再開: %s (%d発話)", session_id, len(self.history))
+
+    def on_delete_selected(self):
+        """チェックされた会話をまとめて削除。"""
+        if self.generating:
+            return
+        ids = [meta["id"] for var, meta in self.session_rows if var.get()]
+        if not ids:
+            self._append_system("削除する履歴にチェックを入れてください")
+            return
+        if not messagebox.askyesno("確認", f"{len(ids)} 件の会話を削除します。よろしいですか?"):
+            return
+        for sid in ids:
+            self.store.delete(sid)
+            if sid == self.current_id:
+                self._start_new_session()
+        self._refresh_sidebar()
+        log.info("[UI] %d 件の履歴を削除", len(ids))
 
     # ---- ハンドラ --------------------------------------------------------
     def on_load(self):
@@ -297,15 +485,13 @@ class ChatApp:
             log.exception("[GEN] 生成中にエラー")
             self.token_queue.put(("error", str(e)))
 
-    def on_clear(self):
-        if self.generating:
-            return
-        self.history.clear()
-        self.chat.config(state="normal")
-        self.chat.delete("1.0", "end")
-        self.chat.config(state="disabled")
-        self._append_system("会話履歴をクリアしました")
-        log.info("[UI] 会話履歴クリア")
+    def on_close(self):
+        """ウィンドウを閉じる前に現在の会話を保存。"""
+        try:
+            self._save_current()
+        finally:
+            log.info("=== 終了 ===")
+            self.root.destroy()
 
     # ---- メインスレッドでの描画更新 -------------------------------------
     def _poll_queue(self):
@@ -320,6 +506,8 @@ class ChatApp:
                     self.history.append({"role": "assistant", "content": self._assistant_buf})
                     self._assistant_buf = ""
                     self._finish_generation("完了")
+                    self._save_current()        # 1往復ごとに自動保存
+                    self._refresh_sidebar()
                 elif kind == "error":
                     self._append_system(f"エラー: {payload}")
                     self._assistant_buf = ""
@@ -331,6 +519,14 @@ class ChatApp:
         except queue.Empty:
             pass
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
+
+    def _repaint_chat(self):
+        """history の内容をチャット表示に描き直す (会話再開時)。"""
+        self.chat.config(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.config(state="disabled")
+        for m in self.history:
+            self._append_message(m["role"], m["content"])
 
     def _append_message(self, role, text):
         label = {"user": "あなた", "assistant": "AI"}.get(role, role)
@@ -371,7 +567,6 @@ def main():
         root.mainloop()
     except KeyboardInterrupt:
         pass
-    log.info("=== 終了 ===")
 
 
 if __name__ == "__main__":
