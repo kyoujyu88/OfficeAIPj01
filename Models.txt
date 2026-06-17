@@ -1,0 +1,7 @@
+gemma-2-2b-jpn-it-Q4_K_M.gguf
+ggml-model-Q8_0.gguf
+LFM2.5-1.2B-JP-Q4_K_M.gguf
+Llama-3.2-3B-Instruct.Q4_K_M.iMatrix.gguf
+Llama-3-ELYZA-JP-8B-q4_k_m.gguf
+Ilm-jp-3-3.7b-instruct-EZO-Humanities-Q4_K_M.gguf
+Yi-Coder-9B.Q4_K_M.gguf
