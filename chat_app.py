@@ -54,6 +54,14 @@ DEFAULT_N_THREADS = os.cpu_count() or 4
 # サイドバーのタイトル表示の最大文字数
 TITLE_MAXLEN = 20
 
+# 停止語 (これが現れたら生成を打ち切る)。
+# モデルが「あなた:」等と続きを勝手に生成する“一人芝居”を防ぐ。
+STOP_WORDS = [
+    "<|im_end|>", "<|im_start|>",   # ChatML (Yi-Coder 等)
+    "\nあなた:", "\nUser:", "\nuser:",
+    "あなた:", "User:",
+]
+
 # UI がワーカースレッドからの出力を取りに行く間隔 (ミリ秒)
 POLL_INTERVAL_MS = 40
 
@@ -177,6 +185,7 @@ class LLMEngine:
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            stop=STOP_WORDS,
             stream=True,
         )
         for chunk in completion:
