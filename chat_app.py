@@ -315,8 +315,10 @@ class ChatApp:
         bottom.pack(fill="x")
         self.input = tk.Text(bottom, height=3, wrap="word", font=("", 11))
         self.input.pack(side="left", fill="x", expand=True)
-        self.input.bind("<Control-Return>", lambda e: self.on_send())
-        self.send_btn = ttk.Button(bottom, text="送信\n(Ctrl+Enter)", command=self.on_send)
+        # Enter で送信 / Shift+Enter で改行
+        self.input.bind("<Return>", lambda e: self.on_send())
+        self.input.bind("<Shift-Return>", self._insert_newline)
+        self.send_btn = ttk.Button(bottom, text="送信\n(Enter)", command=self.on_send)
         self.send_btn.pack(side="left", padx=4, fill="y")
 
     # ---- 会話履歴 (サイドバー) ------------------------------------------
@@ -484,6 +486,11 @@ class ChatApp:
         except Exception as e:  # 推論中の例外もターミナルに出す
             log.exception("[GEN] 生成中にエラー")
             self.token_queue.put(("error", str(e)))
+
+    def _insert_newline(self, event):
+        """Shift+Enter: 送信せず改行を挿入する。"""
+        self.input.insert("insert", "\n")
+        return "break"
 
     def on_close(self):
         """ウィンドウを閉じる前に現在の会話を保存。"""
