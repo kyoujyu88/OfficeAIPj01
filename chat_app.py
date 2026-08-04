@@ -12,16 +12,23 @@
       * クリックで過去の会話を再開
       * チェックを入れて選択した会話をまとめて削除
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
+  - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - ターミナルに動作状況 (状態遷移・性能) をデバッグ出力
 
 備考:
   llama-cpp-python が未導入、またはモデルファイルが見つからない場合は
   「モックモード」で起動し、UI と挙動の確認だけは行えます (実推論は行いません)。
 
+  画像を渡すにはマルチモーダル対応モデル (Gemma 4 等) に加えて、対になる
+  mmproj ファイル (mmproj-*.gguf) をモデルと同じフォルダに置く必要があります。
+  文書ファイルはテキストへ変換して本文に埋め込むため、モデル側の対応は不要です。
+
 実行:
   python chat_app.py
   # モデルの置き場所を指定する場合:
   LLM_MODELS_DIR=/path/to/models python chat_app.py
+  # mmproj を明示指定する場合:
+  LLM_MMPROJ=/path/to/mmproj-gemma-4-E4B.gguf python chat_app.py
 """
 
 import os
@@ -29,12 +36,14 @@ import sys
 import json
 import time
 import queue
+import base64
 import logging
+import mimetypes
 import threading
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 
 # --------------------------------------------------------------------------
 # 設定
@@ -45,8 +54,12 @@ MODELS_DIR = Path(os.environ.get("LLM_MODELS_DIR", ".")).expanduser()
 # 会話履歴 (JSON) の保存先。スクリプトと同じ場所の chat_sessions/ 。
 SESSIONS_DIR = Path(__file__).resolve().parent / "chat_sessions"
 
+# マルチモーダル投影ファイル。未指定ならモデルフォルダから mmproj*.gguf を探す。
+MMPROJ_OVERRIDE = os.environ.get("LLM_MMPROJ")
+
 # 既定の推論パラメータ (CPU 向けの控えめな値)
-DEFAULT_N_CTX = 4096
+# 添付ファイルを本文に埋め込むと入力が長くなるため、環境変数 LLM_N_CTX で調整可。
+DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", 8192))
 DEFAULT_MAX_TOKENS = 512
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_N_THREADS = os.cpu_count() or 4
@@ -64,6 +77,27 @@ STOP_WORDS = [
 
 # UI がワーカースレッドからの出力を取りに行く間隔 (ミリ秒)
 POLL_INTERVAL_MS = 40
+
+# ---- 添付ファイル --------------------------------------------------------
+# 画像はモデルへそのまま渡すため、mmproj を読み込めた場合のみ添付できる。
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+# テキストとして読めるファイル (そのまま本文へ埋め込む)。
+TEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".log",
+    ".yaml", ".yml", ".ini", ".xml", ".html", ".sql",
+    ".py", ".js", ".ts", ".c", ".cpp", ".h", ".java", ".cs", ".bat", ".ps1",
+}
+
+# 変換に外部ライブラリが要る文書形式 {拡張子: (pip 名, 読み込み関数)}。
+# 関数は下で定義するため、辞書の実体は定義後に組み立てる。
+DOC_LIBRARIES = {".pdf": "pypdf", ".docx": "python-docx", ".xlsx": "openpyxl", ".xlsm": "openpyxl"}
+
+# 1 ファイルあたり本文へ埋め込む最大文字数 (n_ctx を溢れさせないための保険)。
+MAX_DOC_CHARS = 6000
+
+# 添付一覧ラベルに表示するファイル名の最大文字数
+ATTACH_LABEL_MAXLEN = 60
 
 # --------------------------------------------------------------------------
 # ロギング (ターミナルへのデバッグ出力)
@@ -102,6 +136,111 @@ def discover_models():
         return names
     log.warning("モデルが見つかりません (MODELS_DIR=%s)", MODELS_DIR.resolve())
     return []
+
+
+def discover_mmproj():
+    """マルチモーダル投影ファイル (mmproj-*.gguf) を探す。無ければ None。"""
+    if MMPROJ_OVERRIDE:
+        p = Path(MMPROJ_OVERRIDE).expanduser()
+        if p.exists():
+            return p
+        log.warning("LLM_MMPROJ が指すファイルがありません: %s", p)
+        return None
+    found = sorted(MODELS_DIR.glob("*mmproj*.gguf"))
+    if len(found) > 1:
+        log.info("mmproj が複数見つかったため先頭を使用します: %s", [p.name for p in found])
+    return found[0] if found else None
+
+
+# --------------------------------------------------------------------------
+# 添付ファイルの読み取り
+# --------------------------------------------------------------------------
+def _read_plain_text(path):
+    """テキスト系ファイルを読む。UTF-8 で駄目なら CP932 (Windows 既定) を試す。"""
+    for encoding in ("utf-8", "cp932"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _read_pdf(path):
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
+def _read_docx(path):
+    import docx
+
+    document = docx.Document(str(path))
+    lines = [p.text for p in document.paragraphs]
+    for table in document.tables:                     # 表はタブ区切りで平坦化
+        for row in table.rows:
+            lines.append("\t".join(cell.text for cell in row.cells))
+    return "\n".join(lines)
+
+
+def _read_xlsx(path):
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(str(path), read_only=True, data_only=True)
+    try:
+        lines = []
+        for sheet in workbook.worksheets:
+            lines.append(f"# シート: {sheet.title}")
+            for row in sheet.iter_rows(values_only=True):
+                if any(v is not None for v in row):
+                    lines.append("\t".join("" if v is None else str(v) for v in row))
+        return "\n".join(lines)
+    finally:
+        workbook.close()
+
+
+DOC_READERS = {".pdf": _read_pdf, ".docx": _read_docx, ".xlsx": _read_xlsx, ".xlsm": _read_xlsx}
+
+# 添付ダイアログに出す対応拡張子
+SUPPORTED_SUFFIXES = IMAGE_SUFFIXES | TEXT_SUFFIXES | set(DOC_READERS)
+
+
+def extract_document_text(path):
+    """文書ファイルからテキストを取り出す。読めない場合は RuntimeError。"""
+    suffix = path.suffix.lower()
+    if suffix in DOC_READERS:
+        try:
+            text = DOC_READERS[suffix](path)
+        except ImportError:
+            lib = DOC_LIBRARIES.get(suffix, "")
+            raise RuntimeError(f"{suffix} を読むには {lib} が必要です (pip install {lib})")
+        except Exception as e:
+            raise RuntimeError(f"読み取りに失敗しました ({e})")
+    elif suffix in TEXT_SUFFIXES:
+        text = _read_plain_text(path)
+    else:
+        raise RuntimeError(f"未対応の形式です: {suffix or '(拡張子なし)'}")
+
+    text = text.strip()
+    if not text:
+        raise RuntimeError("テキストを抽出できませんでした (画像だけの PDF などの可能性)")
+    if len(text) > MAX_DOC_CHARS:
+        omitted = len(text) - MAX_DOC_CHARS
+        log.warning("[添付] %s が長いため %d 文字を省略しました", path.name, omitted)
+        text = text[:MAX_DOC_CHARS] + f"\n…(以降 {omitted} 文字を省略)"
+    return text
+
+
+def plain_content(content):
+    """content (str または OpenAI 形式のパート配列) を表示・保存用の文字列にする。"""
+    if isinstance(content, str):
+        return content
+    texts = [
+        part.get("text", "")
+        for part in (content or [])
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    return "\n".join(t for t in texts if t)
 
 
 # --------------------------------------------------------------------------
@@ -154,6 +293,7 @@ class LLMEngine:
         self.llm = None
         self.model_name = None
         self.load_error = None      # 直近のロード失敗理由 (成功/モック時は None)
+        self.vision = False         # 画像入力が使えるか (mmproj を読み込めた場合のみ True)
 
     def load(self, model_name, n_ctx=DEFAULT_N_CTX, n_threads=DEFAULT_N_THREADS):
         """モデルを読み込む。成功で True、モックで False を返す。
@@ -166,17 +306,20 @@ class LLMEngine:
             self.llm = None
             self.model_name = model_name
             self.load_error = None
+            self.vision = False
             reason = "llama-cpp-python 未導入" if not HAS_LLAMA else "ファイル未検出"
             log.warning("モックモードでロード: %s (%s)", model_name, reason)
             return False
 
         log.info("モデル読み込み開始: %s (n_ctx=%d, n_threads=%d)", model_name, n_ctx, n_threads)
         t0 = time.time()
+        chat_handler = self._build_chat_handler()
         try:
             llm = Llama(
                 model_path=str(path),
                 n_ctx=n_ctx,
                 n_threads=n_threads,
+                chat_handler=chat_handler,
                 verbose=False,
             )
         except Exception as e:
@@ -184,13 +327,40 @@ class LLMEngine:
             self.llm = None
             self.model_name = None
             self.load_error = str(e)
+            self.vision = False
             log.exception("モデル読み込み失敗: %s", model_name)
             raise
         self.llm = llm
         self.model_name = model_name
         self.load_error = None
-        log.info("モデル読み込み完了: %.1f 秒", time.time() - t0)
+        self.vision = chat_handler is not None
+        log.info(
+            "モデル読み込み完了: %.1f 秒 (画像入力 %s)",
+            time.time() - t0, "有効" if self.vision else "無効",
+        )
         return True
+
+    @staticmethod
+    def _build_chat_handler():
+        """mmproj があればマルチモーダル用の chat handler を作る。無ければ None。
+
+        mmproj とモデルが噛み合っているかは実際に生成するまで分からないため、
+        ここで作れても画像を送った時点で失敗することはある (その場合は生成エラー)。
+        """
+        mmproj = discover_mmproj()
+        if mmproj is None:
+            log.info("mmproj が見つかりません -> 画像入力なしで読み込みます")
+            return None
+        try:
+            from llama_cpp.llama_chat_format import Gemma4ChatHandler
+
+            handler = Gemma4ChatHandler(clip_model_path=str(mmproj), verbose=False)
+        except Exception:
+            # mmproj が壊れていても、テキストだけは使えるようにして続行する。
+            log.exception("mmproj の読み込みに失敗 -> 画像入力なしで続行: %s", mmproj)
+            return None
+        log.info("mmproj を使用: %s", mmproj.name)
+        return handler
 
     def stream(self, messages, max_tokens, temperature):
         """応答トークンを順次 yield するジェネレータ。"""
@@ -215,7 +385,7 @@ class LLMEngine:
     @staticmethod
     def _mock_stream(messages):
         """UI 確認用のダミー応答 (1文字ずつ返す)。"""
-        user = messages[-1]["content"] if messages else ""
+        user = plain_content(messages[-1]["content"]) if messages else ""
         text = (
             f"[モック応答] 受け取りました:「{user}」\n"
             "これは UI 動作確認用のダミー応答です。"
@@ -236,6 +406,7 @@ class ChatApp:
         self.store = SessionStore(SESSIONS_DIR)
 
         self.history = []              # [{"role": ..., "content": ...}]
+        self.attachments = []          # 次の送信に添付するファイル [{kind, name, ...}]
         self.current_id = None         # 現在の会話 ID (未保存なら None)
         self.current_created = None    # 現在の会話の作成時刻
         self.session_rows = []         # サイドバー行 [(BooleanVar, meta), ...]
@@ -337,15 +508,31 @@ class ChatApp:
         self.chat.tag_config("assistant", foreground="#0a3069")
         self.chat.tag_config("system", foreground="#999999", font=("", 9, "italic"))
 
-        # 下段: 入力欄 + 送信
+        # 下段: 添付行 + 入力欄 + 送信
         bottom = ttk.Frame(right, padding=(8, 6))
         bottom.pack(fill="x")
-        self.input = tk.Text(bottom, height=3, wrap="word", font=("", 11))
+
+        attach_row = ttk.Frame(bottom)
+        attach_row.pack(fill="x", pady=(0, 4))
+        self.attach_btn = ttk.Button(attach_row, text="ファイル添付", command=self.on_attach)
+        self.attach_btn.pack(side="left")
+        self.attach_clear_btn = ttk.Button(
+            attach_row, text="解除", command=self.on_clear_attachments, state="disabled"
+        )
+        self.attach_clear_btn.pack(side="left", padx=4)
+        self.attach_var = tk.StringVar(value="添付なし")
+        ttk.Label(attach_row, textvariable=self.attach_var, foreground="#666666").pack(
+            side="left", padx=6
+        )
+
+        entry_row = ttk.Frame(bottom)
+        entry_row.pack(fill="x")
+        self.input = tk.Text(entry_row, height=3, wrap="word", font=("", 11))
         self.input.pack(side="left", fill="x", expand=True)
         # Enter で送信 / Shift+Enter で改行
         self.input.bind("<Return>", lambda e: self.on_send())
         self.input.bind("<Shift-Return>", self._insert_newline)
-        self.send_btn = ttk.Button(bottom, text="送信\n(Enter)", command=self.on_send)
+        self.send_btn = ttk.Button(entry_row, text="送信\n(Enter)", command=self.on_send)
         self.send_btn.pack(side="left", padx=4, fill="y")
 
     # ---- 会話履歴 (サイドバー) ------------------------------------------
@@ -353,7 +540,7 @@ class ChatApp:
         """最初のユーザー発話から会話タイトルを作る。"""
         for m in self.history:
             if m["role"] == "user":
-                t = m["content"].strip().replace("\n", " ")
+                t = plain_content(m["content"]).strip().replace("\n", " ")
                 return (t[:TITLE_MAXLEN] + "…") if len(t) > TITLE_MAXLEN else t
         return "新しいチャット"
 
@@ -370,7 +557,9 @@ class ChatApp:
             "created": self.current_created,
             "updated": time.time(),
             "model": self.engine.model_name,
-            "messages": self.history,
+            # 画像は base64 のまま保存すると JSON が肥大するため、本文だけを残す。
+            # (会話を再開すると画像はモデルに渡らず、[添付画像: 名前] の記述だけが残る)
+            "messages": [dict(m, content=plain_content(m["content"])) for m in self.history],
         })
 
     def _refresh_sidebar(self):
@@ -396,6 +585,8 @@ class ChatApp:
         self.history = []
         self.current_id = None
         self.current_created = None
+        self.attachments = []
+        self._refresh_attachments()
         self.chat.config(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.config(state="disabled")
@@ -464,24 +655,120 @@ class ChatApp:
             self.token_queue.put(("load_error", f"{name}: {e}"))
             return
         tag = "ロード完了" if ok else "モックモード (実推論なし)"
-        self.token_queue.put(("loaded", f"{tag}: {name} ({time.time() - t0:.1f}s)"))
+        vision = "画像入力 可" if self.engine.vision else "画像入力 不可 (mmproj 未検出)"
+        self.token_queue.put(("loaded", f"{tag}: {name} ({time.time() - t0:.1f}s) / {vision}"))
 
+    # ---- 添付ファイル ----------------------------------------------------
+    def on_attach(self):
+        """画像 / 文書ファイルを選び、次の送信に添付する。"""
+        if self.generating:
+            return
+        paths = filedialog.askopenfilenames(
+            title="添付するファイルを選択",
+            filetypes=[
+                ("対応ファイル", " ".join(f"*{s}" for s in sorted(SUPPORTED_SUFFIXES))),
+                ("画像", " ".join(f"*{s}" for s in sorted(IMAGE_SUFFIXES))),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+        for raw in paths:
+            path = Path(raw)
+            try:
+                self.attachments.append(self._make_attachment(path))
+            except Exception as e:
+                log.warning("[添付] 追加できません: %s (%s)", path.name, e)
+                self._append_system(f"添付できません: {path.name} ({e})")
+        self._refresh_attachments()
+
+    @staticmethod
+    def _make_attachment(path):
+        """パスから添付エントリを作る。読めない場合は例外を送出。"""
+        if not path.exists():
+            raise RuntimeError("ファイルが見つかりません")
+        if path.suffix.lower() in IMAGE_SUFFIXES:
+            data = path.read_bytes()
+            mime = mimetypes.guess_type(path.name)[0] or "image/png"
+            uri = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+            log.info("[添付] 画像: %s (%.1f KB)", path.name, len(data) / 1024)
+            return {"kind": "image", "name": path.name, "data_uri": uri}
+        text = extract_document_text(path)
+        log.info("[添付] 文書: %s (%d 文字)", path.name, len(text))
+        return {"kind": "document", "name": path.name, "text": text}
+
+    def on_clear_attachments(self):
+        if self.generating or not self.attachments:
+            return
+        log.info("[添付] %d 件を解除", len(self.attachments))
+        self.attachments = []
+        self._refresh_attachments()
+
+    def _refresh_attachments(self):
+        """添付一覧のラベルと解除ボタンの状態を更新する。"""
+        if not self.attachments:
+            self.attach_var.set("添付なし")
+            self.attach_clear_btn.config(state="disabled")
+            return
+        names = ", ".join(a["name"] for a in self.attachments)
+        if len(names) > ATTACH_LABEL_MAXLEN:
+            names = names[:ATTACH_LABEL_MAXLEN] + "…"
+        self.attach_var.set(f"添付 {len(self.attachments)} 件: {names}")
+        self.attach_clear_btn.config(state="normal")
+
+    def _build_content(self, text):
+        """入力文と添付から送信用の content を組み立てる。
+
+        画像が無ければ従来どおり str を返す (モックモードや履歴表示をそのまま使うため)。
+        画像がある場合のみ OpenAI 形式のパート配列にする。
+        """
+        images = [a for a in self.attachments if a["kind"] == "image"]
+        documents = [a for a in self.attachments if a["kind"] == "document"]
+
+        if images and not self.engine.vision:
+            self._append_system(
+                "このモデル構成では画像を渡せません (mmproj 未検出)。テキストのみ送信します"
+            )
+            log.warning("[添付] mmproj 未検出のため画像 %d 件を除外", len(images))
+            images = []
+
+        blocks = [text] if text else []
+        for doc in documents:
+            blocks.append(f"--- 添付ファイル: {doc['name']} ---\n{doc['text']}\n--- ここまで ---")
+        blocks.extend(f"[添付画像: {img['name']}]" for img in images)
+        merged = "\n\n".join(blocks)
+
+        if not images:
+            return merged
+        parts = [{"type": "text", "text": merged}]
+        parts.extend(
+            {"type": "image_url", "image_url": {"url": img["data_uri"]}} for img in images
+        )
+        return parts
+
+    # ---- 送信 ------------------------------------------------------------
     def on_send(self):
         if self.generating:
             log.debug("[UI] 生成中のため送信を無視")
             return "break"
         text = self.input.get("1.0", "end").strip()
-        if not text:
+        if not text and not self.attachments:
             return "break"
         if self.engine.model_name is None:
             self._append_system("先にモデルを読み込んでください")
             log.warning("[UI] モデル未読み込みで送信されました")
             return "break"
 
+        content = self._build_content(text)
         self.input.delete("1.0", "end")
-        self.history.append({"role": "user", "content": text})
-        self._append_message("user", text)
-        log.info("[UI] 送信: %d 文字 / 履歴 %d 件", len(text), len(self.history))
+        self.attachments = []
+        self._refresh_attachments()
+        self.history.append({"role": "user", "content": content})
+        self._append_message("user", plain_content(content))
+        log.info(
+            "[UI] 送信: %d 文字 / 画像 %d 枚 / 履歴 %d 件",
+            len(plain_content(content)),
+            0 if isinstance(content, str) else sum(1 for p in content if p["type"] == "image_url"),
+            len(self.history),
+        )
 
         self.generating = True
         self.send_btn.config(state="disabled")
@@ -571,7 +858,7 @@ class ChatApp:
         self.chat.delete("1.0", "end")
         self.chat.config(state="disabled")
         for m in self.history:
-            self._append_message(m["role"], m["content"])
+            self._append_message(m["role"], plain_content(m["content"]))
 
     def _append_message(self, role, text):
         label = {"user": "あなた", "assistant": "AI"}.get(role, role)
