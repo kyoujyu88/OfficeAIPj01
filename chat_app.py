@@ -59,14 +59,23 @@ MODELS_DIR = Path(os.environ.get("LLM_MODELS_DIR", ".")).expanduser()
 # 会話履歴 (JSON) の保存先。スクリプトと同じ場所の chat_sessions/ 。
 SESSIONS_DIR = Path(__file__).resolve().parent / "chat_sessions"
 
+# アプリ設定 (システムプロンプト・サンプリング値など) の保存先。
+# 会話ごとの設定は各会話の JSON 側に持つ。こちらは「新しいチャットの初期値」。
+SETTINGS_PATH = Path(__file__).resolve().parent / "chat_settings.json"
+
 # マルチモーダル投影ファイル。未指定ならモデルフォルダから mmproj*.gguf を探す。
 MMPROJ_OVERRIDE = os.environ.get("LLM_MMPROJ")
 
-# 既定の推論パラメータ (CPU 向けの控えめな値)
-# 添付ファイルを本文に埋め込むと入力が長くなるため、環境変数 LLM_N_CTX で調整可。
-DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", 8192))
-DEFAULT_MAX_TOKENS = 512
-DEFAULT_N_THREADS = os.cpu_count() or 4
+# 既定の推論パラメータ。
+# 添付ファイルや思考モードで入力・出力とも長くなるため、環境変数で調整できる。
+DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", 16384))
+DEFAULT_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 2048))
+DEFAULT_N_THREADS = int(os.environ.get("LLM_N_THREADS", 0)) or os.cpu_count() or 4
+
+# 思考モードのときに max_tokens へ上乗せする枠。
+# 思考トークンは回答と同じ予算から消費されるため、上乗せしないと
+# 思考だけで使い切って回答が途中で切れる。
+THINKING_EXTRA_TOKENS = int(os.environ.get("LLM_THINKING_TOKENS", 2048))
 
 # サンプリングの既定値は Google が公表している Gemma 4 の推奨値に合わせる。
 DEFAULT_TEMPERATURE = 1.0
@@ -140,19 +149,41 @@ ATTACH_LABEL_MAXLEN = 60
 # --------------------------------------------------------------------------
 # 標準出力の文字コード
 # --------------------------------------------------------------------------
-# Windows の Python は既定でコンソールのコードページ (日本語環境なら cp932) に
-# 合わせて出力するが、VS Code の統合ターミナルは UTF-8 として解釈するため、
-# 日本語のログが化ける。ここで出力側を UTF-8 に揃えて防ぐ。
-# cp932 のターミナル (素の PowerShell 等) で使う場合は LLM_STDIO_ENCODING=cp932、
+# 日本語の Windows では、Python の出力 (既定は cp932) とターミナルの解釈が食い違って
+# ログが化ける。片側だけ UTF-8 にしても直らないため、
+#   1. コンソールのコードページを UTF-8 (65001) にする
+#   2. stdout/stderr も UTF-8 で書く
+# の両方を行って揃える。
+# cp932 のまま使いたい場合は LLM_STDIO_ENCODING=cp932、
 # 何もしてほしくない場合は LLM_STDIO_ENCODING=none を指定する。
 STDIO_ENCODING = os.environ.get("LLM_STDIO_ENCODING", "utf-8")
+
+
+def _configure_windows_console():
+    """Windows コンソールのコードページを UTF-8 に切り替える。
+
+    診断しやすいよう、戻り値は ASCII のみの文字列にする (化けていても読める)。
+    """
+    if os.name != "nt" or STDIO_ENCODING.lower().replace("-", "") != "utf8":
+        return []
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        before = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+        kernel32.SetConsoleOutputCP(65001)
+        kernel32.SetConsoleCP(65001)
+        after = (kernel32.GetConsoleOutputCP(), kernel32.GetConsoleCP())
+        return [f"console codepage: out {before[0]}->{after[0]}, in {before[1]}->{after[1]}"]
+    except Exception as e:
+        return [f"console codepage: FAILED ({e})"]
 
 
 def _configure_stdio_encoding():
     """stdout/stderr の文字コードを揃える。変更内容を ASCII で返す (化けても読める)。"""
     if STDIO_ENCODING.lower() in ("none", "off", ""):
         return []
-    changes = []
+    changes = _configure_windows_console()
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
         if stream is None or not hasattr(stream, "reconfigure"):
@@ -167,6 +198,14 @@ def _configure_stdio_encoding():
             changes.append(f"{name}: {current} -> {STDIO_ENCODING} FAILED ({e})")
             continue
         changes.append(f"{name}: {current} -> {STDIO_ENCODING}")
+    # まだ化ける場合の切り分け用に、最終状態も必ず残す
+    try:
+        changes.append(
+            "state: encoding=%s isatty=%s platform=%s"
+            % (getattr(sys.stdout, "encoding", "?"), sys.stdout.isatty(), sys.platform)
+        )
+    except Exception:
+        pass
     return changes
 
 
@@ -460,6 +499,7 @@ class LLMEngine:
         self.model_name = None
         self.load_error = None      # 直近のロード失敗理由 (成功/モック時は None)
         self.vision = False         # 画像入力が使えるか (mmproj を読み込めた場合のみ True)
+        self.last_finish_reason = None   # 直近の生成の終了理由 ("length" なら打ち切り)
 
     def load(self, model_name, n_ctx=DEFAULT_N_CTX, n_threads=DEFAULT_N_THREADS):
         """モデルを読み込む。成功で True、モックで False を返す。
@@ -530,6 +570,7 @@ class LLMEngine:
 
     def stream(self, messages, max_tokens, temperature, top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K):
         """応答トークンを順次 yield するジェネレータ。"""
+        self.last_finish_reason = None
         if self.llm is None:
             if self.load_error:
                 raise RuntimeError(f"モデルが読み込まれていません: {self.load_error}")
@@ -545,8 +586,10 @@ class LLMEngine:
             stream=True,
         )
         for chunk in completion:
-            delta = chunk["choices"][0]["delta"]
-            piece = delta.get("content")
+            choice = chunk["choices"][0]
+            # "length" なら max_tokens 到達で打ち切られている (回答が途中で切れる原因)
+            self.last_finish_reason = choice.get("finish_reason") or self.last_finish_reason
+            piece = choice["delta"].get("content")
             if piece:
                 yield piece
 
@@ -605,6 +648,7 @@ class ChatApp:
         self._assistant_buf = ""       # ストリーミング中のアシスタント発話バッファ
 
         self._build_ui()
+        self._load_settings()
         self._refresh_sidebar()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
@@ -767,6 +811,56 @@ class ChatApp:
         self.input.bind("<Shift-Return>", self._insert_newline)
         self.send_btn = ttk.Button(entry_row, text="送信\n(Enter)", command=self.on_send)
         self.send_btn.pack(side="left", padx=4, fill="y")
+
+    # ---- アプリ設定 (新しいチャットの初期値) ----------------------------
+    def _settings_fields(self):
+        """{保存キー: (Var, 型変換)}。読み書きで同じ定義を使う。"""
+        return {
+            "system_prompt": (self.system_var, str),
+            "thinking": (self.thinking_var, bool),
+            "show_thought": (self.show_thought_var, bool),
+            "pdf_as_image": (self.pdf_as_image_var, bool),
+            "temperature": (self.temp_var, float),
+            "top_p": (self.top_p_var, float),
+            "top_k": (self.top_k_var, int),
+            "max_tokens": (self.maxtok_var, int),
+            "model": (self.model_var, str),
+        }
+
+    def _load_settings(self):
+        """前回終了時の設定を復元する。無ければ既定値のまま。"""
+        try:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            log.info("[設定] 保存済みの設定はありません (既定値で起動)")
+            return
+        except Exception as e:
+            log.warning("[設定] 読み込みに失敗しました (%s) -> 既定値で起動", e)
+            return
+        for key, (var, cast) in self._settings_fields().items():
+            if key not in data:
+                continue
+            try:
+                value = cast(data[key])
+            except (TypeError, ValueError):
+                continue
+            # モデルは今あるものだけ復元する (前回の環境と違うことがあるため)
+            if key == "model" and value not in (self.model_combo["values"] or ()):
+                continue
+            var.set(value)
+        self._apply_thought_visibility()
+        log.info("[設定] 復元: %s", SETTINGS_PATH)
+
+    def _save_settings(self):
+        """現在の設定を次回起動用に保存する。"""
+        data = {key: cast(var.get()) for key, (var, cast) in self._settings_fields().items()}
+        try:
+            SETTINGS_PATH.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            log.info("[設定] 保存: %s", SETTINGS_PATH)
+        except Exception as e:
+            log.warning("[設定] 保存に失敗しました (%s)", e)
 
     # ---- 会話履歴 (サイドバー) ------------------------------------------
     def _make_title(self):
@@ -1087,6 +1181,12 @@ class ChatApp:
 
     def _start_generation(self):
         """現在の履歴で生成ワーカーを起動する (送信・再生成の共通処理)。"""
+        usage = self.engine.context_usage()
+        if usage and usage[0] > usage[1] * 0.85:
+            self._append_system(
+                f"コンテキストの残りが少なくなっています ({usage[0]}/{usage[1]})。"
+                "「＋ 新規チャット」で始め直すか、LLM_N_CTX を大きくしてください"
+            )
         self.generating = True
         self._stop_event.clear()
         self.send_btn.config(state="disabled")
@@ -1099,8 +1199,12 @@ class ChatApp:
         system = self._system_message()
         if system:
             messages.insert(0, system)
+        max_tokens = int(self.maxtok_var.get())
+        if self.thinking_var.get():
+            # 思考は回答と同じ予算を消費するので、その分を上乗せする
+            max_tokens += THINKING_EXTRA_TOKENS
         params = {
-            "max_tokens": int(self.maxtok_var.get()),
+            "max_tokens": max_tokens,
             "temperature": float(self.temp_var.get()),
             "top_p": float(self.top_p_var.get()),
             "top_k": int(self.top_k_var.get()),
@@ -1138,11 +1242,15 @@ class ChatApp:
                 self.token_queue.put((kind, text))
             dt = time.time() - (first or t0)
             speed = n / dt if dt > 0 else 0.0
+            finish = getattr(self.engine, "last_finish_reason", None)
             log.info(
-                "[GEN] %s: %d tokens, 総 %.2fs, %.1f tok/s",
-                "停止" if stopped else "完了", n, time.time() - t0, speed,
+                "[GEN] %s: %d tokens, 総 %.2fs, %.1f tok/s (finish_reason=%s)",
+                "停止" if stopped else "完了", n, time.time() - t0, speed, finish,
             )
-            self.token_queue.put(("stopped" if stopped else "end", (n, speed)))
+            self.token_queue.put((
+                "stopped" if stopped else "end",
+                {"tokens": n, "speed": speed, "finish": finish},
+            ))
         except Exception as e:  # 推論中の例外もターミナルに出す
             log.exception("[GEN] 生成中にエラー")
             self.token_queue.put(("error", str(e)))
@@ -1153,9 +1261,10 @@ class ChatApp:
         return "break"
 
     def on_close(self):
-        """ウィンドウを閉じる前に現在の会話を保存。"""
+        """ウィンドウを閉じる前に現在の会話と設定を保存。"""
         try:
             self._save_current()
+            self._save_settings()
         finally:
             log.info("=== 終了 ===")
             self.root.destroy()
@@ -1173,18 +1282,34 @@ class ChatApp:
                     # 思考は表示するだけで履歴には残さない (次のターンへは渡さない)
                     self._stream_token(payload, "thought")
                 elif kind in ("end", "stopped"):
-                    tokens, speed = payload
                     if self._assistant_buf:
                         self.history.append(
                             {"role": "assistant", "content": self._assistant_buf}
                         )
                     self._assistant_buf = ""
-                    label = "完了" if kind == "end" else "停止"
-                    self._finish_generation(f"{label} ({tokens} tokens, {speed:.1f} tok/s)")
+                    truncated = payload.get("finish") == "length"
+                    if kind == "stopped":
+                        label = "停止"
+                    elif truncated:
+                        label = "打ち切り"
+                        self._append_system(
+                            "max_tokens に達したため回答が途中で終わりました。"
+                            "max_tokens を増やすか、「再生成」でやり直してください"
+                        )
+                    else:
+                        label = "完了"
+                    self._finish_generation(
+                        f"{label} ({payload['tokens']} tokens, {payload['speed']:.1f} tok/s)"
+                    )
                     self._save_current()        # 1往復ごとに自動保存
                     self._refresh_sidebar()
                 elif kind == "error":
                     self._append_system(f"エラー: {payload}")
+                    if "context window" in payload.lower():
+                        self._append_system(
+                            "入力と max_tokens の合計がコンテキスト長を超えています。"
+                            "max_tokens を減らすか、LLM_N_CTX を大きくして起動し直してください"
+                        )
                     self._assistant_buf = ""
                     self._finish_generation("エラー")
                 elif kind == "loaded":
