@@ -153,32 +153,50 @@ class LLMEngine:
     def __init__(self):
         self.llm = None
         self.model_name = None
+        self.load_error = None      # 直近のロード失敗理由 (成功/モック時は None)
 
     def load(self, model_name, n_ctx=DEFAULT_N_CTX, n_threads=DEFAULT_N_THREADS):
-        """モデルを読み込む。成功で True、モックで False を返す。"""
+        """モデルを読み込む。成功で True、モックで False を返す。
+
+        ファイルはあるが llama.cpp が読めない場合 (破損・未対応アーキテクチャ等)
+        は例外をそのまま送出する。呼び出し側で捕捉して UI に伝えること。
+        """
         path = MODELS_DIR / model_name
         if not HAS_LLAMA or not path.exists():
             self.llm = None
             self.model_name = model_name
+            self.load_error = None
             reason = "llama-cpp-python 未導入" if not HAS_LLAMA else "ファイル未検出"
             log.warning("モックモードでロード: %s (%s)", model_name, reason)
             return False
 
         log.info("モデル読み込み開始: %s (n_ctx=%d, n_threads=%d)", model_name, n_ctx, n_threads)
         t0 = time.time()
-        self.llm = Llama(
-            model_path=str(path),
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            verbose=False,
-        )
+        try:
+            llm = Llama(
+                model_path=str(path),
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                verbose=False,
+            )
+        except Exception as e:
+            # 失敗理由を残しておき、モック応答へ暗黙に落ちないようにする。
+            self.llm = None
+            self.model_name = None
+            self.load_error = str(e)
+            log.exception("モデル読み込み失敗: %s", model_name)
+            raise
+        self.llm = llm
         self.model_name = model_name
+        self.load_error = None
         log.info("モデル読み込み完了: %.1f 秒", time.time() - t0)
         return True
 
     def stream(self, messages, max_tokens, temperature):
         """応答トークンを順次 yield するジェネレータ。"""
         if self.llm is None:
+            if self.load_error:
+                raise RuntimeError(f"モデルが読み込まれていません: {self.load_error}")
             yield from self._mock_stream(messages)
             return
         completion = self.llm.create_chat_completion(
@@ -437,7 +455,14 @@ class ChatApp:
 
     def _load_worker(self, name):
         t0 = time.time()
-        ok = self.engine.load(name)
+        try:
+            ok = self.engine.load(name)
+        except Exception as e:
+            # ここで握らないとローダースレッドごと落ち、
+            # UI が「読み込み中 ...」のまま読み込みボタンも無効のまま固まる。
+            log.exception("[LOAD] 読み込み中にエラー")
+            self.token_queue.put(("load_error", f"{name}: {e}"))
+            return
         tag = "ロード完了" if ok else "モックモード (実推論なし)"
         self.token_queue.put(("loaded", f"{tag}: {name} ({time.time() - t0:.1f}s)"))
 
@@ -531,6 +556,10 @@ class ChatApp:
                 elif kind == "loaded":
                     self.status_var.set(payload)
                     self._append_system(payload)
+                    self.load_btn.config(state="normal")
+                elif kind == "load_error":
+                    self.status_var.set("読み込み失敗")
+                    self._append_system(f"モデル読み込み失敗: {payload}")
                     self.load_btn.config(state="normal")
         except queue.Empty:
             pass
