@@ -72,6 +72,14 @@ DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", 16384))
 DEFAULT_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 2048))
 DEFAULT_N_THREADS = int(os.environ.get("LLM_N_THREADS", 0)) or os.cpu_count() or 4
 
+# 履歴をモデルへ送るときの予算計算。
+# チャットテンプレートの制御トークン等のぶんを余白として引いておく。
+CONTEXT_MARGIN_TOKENS = 256
+# 1 メッセージあたりの制御トークン (ロール表記やターン区切り) の見積り
+MESSAGE_OVERHEAD_TOKENS = 8
+# 画像 1 枚あたりのトークン数の見積り (実際はモデル依存なので多めに見る)
+IMAGE_TOKEN_ESTIMATE = 320
+
 # 思考モードのときに max_tokens へ上乗せする枠。
 # 思考トークンは回答と同じ予算から消費されるため、上乗せしないと
 # 思考だけで使い切って回答が途中で切れる。
@@ -392,6 +400,66 @@ def image_attachment(name, data, mime="image/png"):
     return {"kind": "image", "name": name, "data_uri": uri}
 
 
+def message_tokens(message, count_tokens):
+    """1 メッセージが消費するおおよそのトークン数。"""
+    content = message.get("content")
+    images = 0 if isinstance(content, str) else sum(
+        1 for part in content or []
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    )
+    return (
+        count_tokens(plain_content(content))
+        + images * IMAGE_TOKEN_ESTIMATE
+        + MESSAGE_OVERHEAD_TOKENS
+    )
+
+
+def strip_images(message):
+    """画像パートを外して本文だけにする。画像が無ければ元のまま返す。"""
+    content = message.get("content")
+    if isinstance(content, str):
+        return message
+    return dict(message, content=plain_content(content))
+
+
+def fit_to_budget(messages, budget, count_tokens):
+    """モデルへ送るメッセージを予算 (トークン数) に収める。
+
+    システムプロンプトは必ず残す。会話が伸びてもシステムプロンプトが
+    押し出されないようにするのが目的。
+
+      1. そのまま収まればそのまま
+      2. 収まらなければ、最新の 1 件を除いて画像を外す (画像は重いわりに
+         後続のターンでは参照されないことが多い)
+      3. それでも収まらなければ、古い発話から落とす (最後の 1 件は必ず残す)
+
+    戻り値は (送るメッセージ, 落とした件数, 画像を外した件数)。
+    画面と保存済み履歴はそのままで、モデルへの入力だけを削る。
+    """
+    system = [m for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    base = sum(message_tokens(m, count_tokens) for m in system)
+    costs = [message_tokens(m, count_tokens) for m in rest]
+
+    if base + sum(costs) <= budget:
+        return messages, 0, 0
+
+    stripped = 0
+    for i in range(len(rest) - 1):          # 最新の 1 件は画像を残す
+        lighter = strip_images(rest[i])
+        if lighter is not rest[i]:
+            rest[i] = lighter
+            costs[i] = message_tokens(lighter, count_tokens)
+            stripped += 1
+
+    dropped = 0
+    while len(rest) > 1 and base + sum(costs) > budget:
+        rest.pop(0)
+        costs.pop(0)
+        dropped += 1
+    return system + rest, dropped, stripped
+
+
 class ThoughtSplitter:
     """ストリーム中のテキストを「思考」と「回答」に振り分ける。
 
@@ -592,6 +660,27 @@ class LLMEngine:
             piece = choice["delta"].get("content")
             if piece:
                 yield piece
+
+    def count_tokens(self, text):
+        """テキストのトークン数。モデル未読み込みなら文字数からの概算。"""
+        if not text:
+            return 0
+        if self.llm is not None:
+            try:
+                return len(self.llm.tokenize(text.encode("utf-8"), add_bos=False))
+            except Exception:
+                pass
+        return max(1, len(text) // 2)       # 日本語は 1 トークン ≒ 1〜2 文字
+
+    def context_budget(self, max_tokens):
+        """履歴に使えるトークン数 = コンテキスト長 - 生成枠 - 余白。"""
+        n_ctx = DEFAULT_N_CTX
+        if self.llm is not None:
+            try:
+                n_ctx = int(self.llm.n_ctx())
+            except Exception:
+                pass
+        return max(512, n_ctx - max_tokens - CONTEXT_MARGIN_TOKENS)
 
     def context_usage(self):
         """(使用トークン数, コンテキスト長) を返す。分からなければ None。"""
@@ -1187,14 +1276,6 @@ class ChatApp:
                 f"コンテキストの残りが少なくなっています ({usage[0]}/{usage[1]})。"
                 "「＋ 新規チャット」で始め直すか、LLM_N_CTX を大きくしてください"
             )
-        self.generating = True
-        self._stop_event.clear()
-        self.send_btn.config(state="disabled")
-        self.regen_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self.status_var.set("生成中 ...")
-        self._append_message("assistant", "")  # "AI: " の見出しだけ先に表示
-
         messages = list(self.history)
         system = self._system_message()
         if system:
@@ -1203,12 +1284,43 @@ class ChatApp:
         if self.thinking_var.get():
             # 思考は回答と同じ予算を消費するので、その分を上乗せする
             max_tokens += THINKING_EXTRA_TOKENS
+
+        # 履歴が伸びてもシステムプロンプトが押し出されないよう、予算内に収める
+        budget = self.engine.context_budget(max_tokens)
+        messages, dropped, stripped = fit_to_budget(
+            messages, budget, self.engine.count_tokens
+        )
+        if dropped or stripped:
+            log.info(
+                "[CTX] 予算 %d トークンに調整: 古い発話 %d 件を除外 / 画像 %d 件を除外",
+                budget, dropped, stripped,
+            )
+            notes = []
+            if dropped:
+                notes.append(f"古い発話 {dropped} 件")
+            if stripped:
+                notes.append(f"過去の画像 {stripped} 件")
+            self._append_system(
+                f"コンテキストに収めるため、{'と'.join(notes)}を今回の送信から外しました"
+                " (画面と保存済みの履歴はそのまま残ります)"
+            )
+
         params = {
             "max_tokens": max_tokens,
             "temperature": float(self.temp_var.get()),
             "top_p": float(self.top_p_var.get()),
             "top_k": int(self.top_k_var.get()),
         }
+
+        # 準備が済んでから UI を生成中の状態にする (通知が "AI:" の後に出ないように)
+        self.generating = True
+        self._stop_event.clear()
+        self.send_btn.config(state="disabled")
+        self.regen_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.status_var.set("生成中 ...")
+        self._append_message("assistant", "")  # "AI: " の見出しだけ先に表示
+
         threading.Thread(
             target=self._gen_worker, args=(messages, params), name="gen", daemon=True,
         ).start()
