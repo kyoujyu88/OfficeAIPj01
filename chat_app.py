@@ -7,7 +7,9 @@
   - Tkinter 製の GUI チャット (Python 標準ライブラリのみ。追加インストール不要)
   - llama-cpp-python で GGUF モデルを CPU 推論
   - 生成トークンをストリーミング表示 (生成中に逐次表示)
-  - モデル選択 / temperature / max_tokens を UI から調整
+  - 生成の停止 / 直前の応答の再生成
+  - モデル選択 / temperature / top_p / top_k / max_tokens を UI から調整
+  - システムプロンプトと思考 (reasoning) モード
   - 左サイドバーに会話履歴を一覧表示
       * クリックで過去の会話を再開
       * チェックを入れて選択した会話をまとめて削除
@@ -16,6 +18,7 @@
   - ターミナルに動作状況 (状態遷移・性能) をデバッグ出力
 
 備考:
+  既定値は Gemma 4 (E2B / E4B / 12B ほか) を前提に合わせています。
   llama-cpp-python が未導入、またはモデルファイルが見つからない場合は
   「モックモード」で起動し、UI と挙動の確認だけは行えます (実推論は行いません)。
 
@@ -63,19 +66,48 @@ MMPROJ_OVERRIDE = os.environ.get("LLM_MMPROJ")
 # 添付ファイルを本文に埋め込むと入力が長くなるため、環境変数 LLM_N_CTX で調整可。
 DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", 8192))
 DEFAULT_MAX_TOKENS = 512
-DEFAULT_TEMPERATURE = 0.7
 DEFAULT_N_THREADS = os.cpu_count() or 4
+
+# サンプリングの既定値は Google が公表している Gemma 4 の推奨値に合わせる。
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 0.95
+DEFAULT_TOP_K = 64
 
 # サイドバーのタイトル表示の最大文字数
 TITLE_MAXLEN = 20
 
+# ---- Gemma 4 の制御トークン --------------------------------------------
+# 思考 (reasoning) はシステムプロンプト先頭の <|think|> で有効になる。
+THINK_TOKEN = "<|think|>"
+# 思考を有効にすると、最終回答の前に思考チャネルが出力される。
+#   <|channel>thought
+#   [内部の思考]
+#   <channel|>
+#   [最終回答]
+THOUGHT_OPEN = "<|channel>thought"
+THOUGHT_CLOSE = "<channel|>"
+
 # 停止語 (これが現れたら生成を打ち切る)。
-# モデルが「あなた:」等と続きを勝手に生成する“一人芝居”を防ぐ。
-STOP_WORDS = [
+# チャットテンプレートを使う場合、本来 EOS で止まるので特殊トークンだけで足りる。
+STOP_TOKENS = [
+    "<turn|>", "<|turn>",           # Gemma 4 のターン区切り
     "<|im_end|>", "<|im_start|>",   # ChatML (Yi-Coder 等)
+]
+# チャットテンプレートを持たない古いモデル向けの保険。
+# 「あなた:」等と続きを勝手に生成する“一人芝居”を防ぐが、正規の応答に
+# これらの語が含まれると途中で切れてしまうため、Gemma 4 では使わない。
+LEGACY_STOP_WORDS = [
     "\nあなた:", "\nUser:", "\nuser:",
     "あなた:", "User:",
 ]
+
+
+def stop_words_for(model_name):
+    """モデル名に応じた停止語を返す。"""
+    name = (model_name or "").lower()
+    if "gemma-4" in name or "gemma4" in name:
+        return list(STOP_TOKENS)
+    return STOP_TOKENS + LEGACY_STOP_WORDS
 
 # UI がワーカースレッドからの出力を取りに行く間隔 (ミリ秒)
 POLL_INTERVAL_MS = 40
@@ -321,6 +353,50 @@ def image_attachment(name, data, mime="image/png"):
     return {"kind": "image", "name": name, "data_uri": uri}
 
 
+class ThoughtSplitter:
+    """ストリーム中のテキストを「思考」と「回答」に振り分ける。
+
+    Gemma 4 は思考モード時に <|channel>thought ... <channel|> という区切りで
+    内部の思考を先に出力する。トークンは細切れで届き、区切り文字列が
+    チャンクをまたぐことがあるため、判定できない末尾は次回に持ち越す。
+    """
+
+    def __init__(self):
+        self.buffer = ""
+        self.in_thought = False
+
+    def feed(self, piece):
+        """[(種別, テキスト), ...] を返す。種別は "thought" か "answer"。"""
+        self.buffer += piece
+        out = []
+        while True:
+            marker = THOUGHT_CLOSE if self.in_thought else THOUGHT_OPEN
+            kind = "thought" if self.in_thought else "answer"
+            index = self.buffer.find(marker)
+            if index >= 0:
+                if index:
+                    out.append((kind, self.buffer[:index]))
+                self.buffer = self.buffer[index + len(marker):]
+                self.in_thought = not self.in_thought
+                continue
+            # 区切りの一部が末尾に来ている可能性があるぶんだけ残す
+            keep = len(marker) - 1
+            if len(self.buffer) > keep:
+                out.append((kind, self.buffer[:-keep] if keep else self.buffer))
+                self.buffer = self.buffer[-keep:] if keep else ""
+            break
+        return [(k, t) for k, t in out if t]
+
+    def flush(self):
+        """残りを吐き出す。生成終了時に呼ぶ。"""
+        if not self.buffer:
+            return []
+        kind = "thought" if self.in_thought else "answer"
+        out = [(kind, self.buffer)]
+        self.buffer = ""
+        return out
+
+
 def plain_content(content):
     """content (str または OpenAI 形式のパート配列) を表示・保存用の文字列にする。"""
     if isinstance(content, str):
@@ -452,7 +528,7 @@ class LLMEngine:
         log.info("mmproj を使用: %s", mmproj.name)
         return handler
 
-    def stream(self, messages, max_tokens, temperature):
+    def stream(self, messages, max_tokens, temperature, top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K):
         """応答トークンを順次 yield するジェネレータ。"""
         if self.llm is None:
             if self.load_error:
@@ -463,7 +539,9 @@ class LLMEngine:
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            stop=STOP_WORDS,
+            top_p=top_p,
+            top_k=top_k,
+            stop=stop_words_for(self.model_name),
             stream=True,
         )
         for chunk in completion:
@@ -472,15 +550,35 @@ class LLMEngine:
             if piece:
                 yield piece
 
+    def context_usage(self):
+        """(使用トークン数, コンテキスト長) を返す。分からなければ None。"""
+        if self.llm is None:
+            return None
+        try:
+            used = int(getattr(self.llm, "n_tokens", 0))
+            total = int(self.llm.n_ctx())
+        except Exception:
+            return None
+        if total <= 0:
+            return None
+        return used, total
+
     @staticmethod
     def _mock_stream(messages):
         """UI 確認用のダミー応答 (1文字ずつ返す)。"""
         user = plain_content(messages[-1]["content"]) if messages else ""
+        thinking = any(
+            m["role"] == "system" and THINK_TOKEN in plain_content(m["content"])
+            for m in messages
+        )
         text = (
             f"[モック応答] 受け取りました:「{user}」\n"
             "これは UI 動作確認用のダミー応答です。"
             "実モデルを読み込むと、ここに生成結果がストリーミング表示されます。"
         )
+        if thinking:
+            # 思考モードの表示確認用に、思考チャネル付きの応答を模擬する
+            text = f"{THOUGHT_OPEN}\nユーザーの意図を整理している……\n{THOUGHT_CLOSE}\n{text}"
         for ch in text:
             time.sleep(0.015)
             yield ch
@@ -503,6 +601,7 @@ class ChatApp:
 
         self.token_queue = queue.Queue()
         self.generating = False
+        self._stop_event = threading.Event()   # 生成の打ち切り要求
         self._assistant_buf = ""       # ストリーミング中のアシスタント発話バッファ
 
         self._build_ui()
@@ -575,7 +674,7 @@ class ChatApp:
             side="left", padx=8
         )
 
-        # オプション段: temperature / max_tokens
+        # オプション段 1: サンプリング (既定値は Gemma 4 の推奨値)
         opt = ttk.Frame(right, padding=(8, 0))
         opt.pack(fill="x")
         ttk.Label(opt, text="temperature:").pack(side="left")
@@ -583,11 +682,38 @@ class ChatApp:
         ttk.Spinbox(
             opt, from_=0.0, to=2.0, increment=0.1, width=5, textvariable=self.temp_var
         ).pack(side="left", padx=(2, 10))
+        ttk.Label(opt, text="top_p:").pack(side="left")
+        self.top_p_var = tk.DoubleVar(value=DEFAULT_TOP_P)
+        ttk.Spinbox(
+            opt, from_=0.0, to=1.0, increment=0.05, width=5, textvariable=self.top_p_var
+        ).pack(side="left", padx=(2, 10))
+        ttk.Label(opt, text="top_k:").pack(side="left")
+        self.top_k_var = tk.IntVar(value=DEFAULT_TOP_K)
+        ttk.Spinbox(
+            opt, from_=1, to=200, increment=1, width=5, textvariable=self.top_k_var
+        ).pack(side="left", padx=(2, 10))
         ttk.Label(opt, text="max_tokens:").pack(side="left")
         self.maxtok_var = tk.IntVar(value=DEFAULT_MAX_TOKENS)
         ttk.Spinbox(
-            opt, from_=16, to=4096, increment=16, width=6, textvariable=self.maxtok_var
+            opt, from_=16, to=8192, increment=16, width=6, textvariable=self.maxtok_var
         ).pack(side="left", padx=2)
+
+        # オプション段 2: システムプロンプト / 思考モード
+        sysrow = ttk.Frame(right, padding=(8, 4))
+        sysrow.pack(fill="x")
+        ttk.Label(sysrow, text="システムプロンプト:").pack(side="left")
+        self.system_var = tk.StringVar(value="")
+        ttk.Entry(sysrow, textvariable=self.system_var).pack(
+            side="left", fill="x", expand=True, padx=(4, 8)
+        )
+        # 思考モード: システムプロンプト先頭に <|think|> を付けて有効化する
+        self.thinking_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(sysrow, text="思考モード", variable=self.thinking_var).pack(side="left")
+        self.show_thought_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            sysrow, text="思考を表示", variable=self.show_thought_var,
+            command=self._apply_thought_visibility,
+        ).pack(side="left", padx=(4, 0))
 
         # 中段: チャット履歴表示
         self.chat = scrolledtext.ScrolledText(
@@ -597,6 +723,8 @@ class ChatApp:
         self.chat.tag_config("user", foreground="#1a7f37", font=("", 11, "bold"))
         self.chat.tag_config("assistant", foreground="#0a3069")
         self.chat.tag_config("system", foreground="#999999", font=("", 9, "italic"))
+        self.chat.tag_config("thought", foreground="#8250df", font=("", 9, "italic"))
+        self._apply_thought_visibility()
 
         # 下段: 添付行 + 入力欄 + 送信
         bottom = ttk.Frame(right, padding=(8, 6))
@@ -620,6 +748,15 @@ class ChatApp:
         ttk.Label(attach_row, textvariable=self.attach_var, foreground="#666666").pack(
             side="left", padx=6
         )
+        # 生成の制御は右寄せ (生成中のみ停止、生成後のみ再生成が押せる)
+        self.stop_btn = ttk.Button(
+            attach_row, text="停止", command=self.on_stop, state="disabled"
+        )
+        self.stop_btn.pack(side="right")
+        self.regen_btn = ttk.Button(
+            attach_row, text="再生成", command=self.on_regenerate, state="disabled"
+        )
+        self.regen_btn.pack(side="right", padx=4)
 
         entry_row = ttk.Frame(bottom)
         entry_row.pack(fill="x")
@@ -653,6 +790,8 @@ class ChatApp:
             "created": self.current_created,
             "updated": time.time(),
             "model": self.engine.model_name,
+            "system_prompt": self.system_var.get(),
+            "thinking": bool(self.thinking_var.get()),
             # 画像は base64 のまま保存すると JSON が肥大するため、本文だけを残す。
             # (会話を再開すると画像はモデルに渡らず、[添付画像: 名前] の記述だけが残る)
             "messages": [dict(m, content=plain_content(m["content"])) for m in self.history],
@@ -686,6 +825,12 @@ class ChatApp:
         self.chat.config(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.config(state="disabled")
+        self._refresh_regen_button()
+
+    def _refresh_regen_button(self):
+        """再生成できる応答があるときだけボタンを有効にする。"""
+        enabled = not self.generating and any(m["role"] == "assistant" for m in self.history)
+        self.regen_btn.config(state="normal" if enabled else "disabled")
 
     def on_new_chat(self):
         if self.generating:
@@ -705,8 +850,11 @@ class ChatApp:
         self.history = data.get("messages", [])
         self.current_id = data["id"]
         self.current_created = data.get("created", time.time())
+        self.system_var.set(data.get("system_prompt", ""))
+        self.thinking_var.set(bool(data.get("thinking", False)))
         self._repaint_chat()
         self._refresh_sidebar()
+        self._refresh_regen_button()
         self.status_var.set(f"会話を再開: {data.get('title', '')}")
         log.info("[UI] 会話を再開: %s (%d発話)", session_id, len(self.history))
 
@@ -901,40 +1049,100 @@ class ChatApp:
             len(self.history),
         )
 
+        self._start_generation()
+        return "break"
+
+    def on_regenerate(self):
+        """直前の応答を捨てて、同じ入力で生成し直す。"""
+        if self.generating or self.engine.model_name is None:
+            return
+        last = next(
+            (i for i in range(len(self.history) - 1, -1, -1)
+             if self.history[i]["role"] == "assistant"),
+            None,
+        )
+        if last is None:
+            self._append_system("再生成できる応答がありません")
+            return
+        self.history = self.history[:last]
+        self._repaint_chat()
+        log.info("[UI] 再生成 (履歴 %d 件から)", len(self.history))
+        self._start_generation()
+
+    def on_stop(self):
+        """生成中のワーカーに停止を伝える。そこまでの応答は残す。"""
+        if not self.generating:
+            return
+        self._stop_event.set()
+        self.stop_btn.config(state="disabled")
+        self.status_var.set("停止中 ...")
+        log.info("[UI] 停止要求")
+
+    def _system_message(self):
+        """システムプロンプト (思考モードなら先頭に <|think|>) を組み立てる。"""
+        text = self.system_var.get().strip()
+        if self.thinking_var.get():
+            text = f"{THINK_TOKEN}\n{text}" if text else THINK_TOKEN
+        return {"role": "system", "content": text} if text else None
+
+    def _start_generation(self):
+        """現在の履歴で生成ワーカーを起動する (送信・再生成の共通処理)。"""
         self.generating = True
+        self._stop_event.clear()
         self.send_btn.config(state="disabled")
+        self.regen_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
         self.status_var.set("生成中 ...")
         self._append_message("assistant", "")  # "AI: " の見出しだけ先に表示
 
-        temp = float(self.temp_var.get())
-        max_tok = int(self.maxtok_var.get())
+        messages = list(self.history)
+        system = self._system_message()
+        if system:
+            messages.insert(0, system)
+        params = {
+            "max_tokens": int(self.maxtok_var.get()),
+            "temperature": float(self.temp_var.get()),
+            "top_p": float(self.top_p_var.get()),
+            "top_k": int(self.top_k_var.get()),
+        }
         threading.Thread(
-            target=self._gen_worker,
-            args=(list(self.history), max_tok, temp),
-            name="gen",
-            daemon=True,
+            target=self._gen_worker, args=(messages, params), name="gen", daemon=True,
         ).start()
-        return "break"
 
-    def _gen_worker(self, messages, max_tokens, temperature):
-        log.info("[GEN] 生成開始 (max_tokens=%d, temperature=%.2f)", max_tokens, temperature)
+    def _gen_worker(self, messages, params):
+        log.info(
+            "[GEN] 生成開始 (max_tokens=%(max_tokens)d, temperature=%(temperature).2f,"
+            " top_p=%(top_p).2f, top_k=%(top_k)d)", params,
+        )
         t0 = time.time()
         first = None
         n = 0
+        splitter = ThoughtSplitter()
+        stopped = False
         try:
-            for piece in self.engine.stream(messages, max_tokens, temperature):
+            for piece in self.engine.stream(messages, **params):
+                if self._stop_event.is_set():
+                    stopped = True
+                    log.info("[GEN] 停止要求により打ち切り (%d tokens)", n)
+                    break
                 if first is None:
                     first = time.time()
                     log.info("[GEN] 初トークンまで %.2fs", first - t0)
                 n += 1
-                self.token_queue.put(("token", piece))
+                for kind, text in splitter.feed(piece):
+                    self.token_queue.put((kind, text))
                 if n % 20 == 0:
                     dt = time.time() - (first or t0)
                     log.debug("[GEN] 経過 %d tokens, %.1f tok/s", n, n / dt if dt > 0 else 0.0)
+            for kind, text in splitter.flush():
+                self.token_queue.put((kind, text))
             dt = time.time() - (first or t0)
             speed = n / dt if dt > 0 else 0.0
-            log.info("[GEN] 完了: %d tokens, 総 %.2fs, %.1f tok/s", n, time.time() - t0, speed)
-            self.token_queue.put(("end", n))
+            log.info(
+                "[GEN] %s: %d tokens, 総 %.2fs, %.1f tok/s",
+                "停止" if stopped else "完了", n, time.time() - t0, speed,
+            )
+            self.token_queue.put(("stopped" if stopped else "end", (n, speed)))
         except Exception as e:  # 推論中の例外もターミナルに出す
             log.exception("[GEN] 生成中にエラー")
             self.token_queue.put(("error", str(e)))
@@ -958,13 +1166,21 @@ class ChatApp:
         try:
             while True:
                 kind, payload = self.token_queue.get_nowait()
-                if kind == "token":
+                if kind == "answer":
                     self._assistant_buf += payload
-                    self._stream_token(payload)
-                elif kind == "end":
-                    self.history.append({"role": "assistant", "content": self._assistant_buf})
+                    self._stream_token(payload, "assistant")
+                elif kind == "thought":
+                    # 思考は表示するだけで履歴には残さない (次のターンへは渡さない)
+                    self._stream_token(payload, "thought")
+                elif kind in ("end", "stopped"):
+                    tokens, speed = payload
+                    if self._assistant_buf:
+                        self.history.append(
+                            {"role": "assistant", "content": self._assistant_buf}
+                        )
                     self._assistant_buf = ""
-                    self._finish_generation("完了")
+                    label = "完了" if kind == "end" else "停止"
+                    self._finish_generation(f"{label} ({tokens} tokens, {speed:.1f} tok/s)")
                     self._save_current()        # 1往復ごとに自動保存
                     self._refresh_sidebar()
                 elif kind == "error":
@@ -1000,11 +1216,15 @@ class ChatApp:
         self.chat.config(state="disabled")
         self.chat.see("end")
 
-    def _stream_token(self, piece):
+    def _stream_token(self, piece, tag="assistant"):
         self.chat.config(state="normal")
-        self.chat.insert("end", piece, "assistant")
+        self.chat.insert("end", piece, tag)
         self.chat.config(state="disabled")
         self.chat.see("end")
+
+    def _apply_thought_visibility(self):
+        """「思考を表示」に合わせて、思考タグの折りたたみを切り替える。"""
+        self.chat.tag_config("thought", elide=not self.show_thought_var.get())
 
     def _append_system(self, text):
         self.chat.config(state="normal")
@@ -1014,7 +1234,14 @@ class ChatApp:
 
     def _finish_generation(self, status):
         self.generating = False
+        self._stop_event.clear()
         self.send_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self._refresh_regen_button()
+        usage = self.engine.context_usage()
+        if usage:
+            used, total = usage
+            status = f"{status} / コンテキスト {used}/{total} ({used * 100 // total}%)"
         self.status_var.set(status)
         self.chat.config(state="normal")
         self.chat.insert("end", "\n")
