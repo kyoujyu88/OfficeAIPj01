@@ -11,7 +11,7 @@ Python 標準ライブラリ (Tkinter) だけで動く、エージェント的�
 - 追加インストール不要 (Tkinter は Python 標準。要 `python3-tk` パッケージ)
 - モデル選択 / temperature / max_tokens を UI から調整
 - 生成トークンのストリーミング表示
-- ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
+- ファイル添付 (画像 / PDF / Word / Excel / テキスト系。PDF はページ画像としても渡せる)
 - ターミナルに動作状況 (状態遷移・初トークン遅延・tok/s 等) を随時デバッグ出力
 - `llama-cpp-python` 未導入時やモデル未検出時は「モックモード」で UI 確認が可能
 
@@ -29,6 +29,19 @@ LLM_MODELS_DIR=/path/to/models python chat_app.py
 | `LLM_MODELS_DIR` | カレントディレクトリ | `.gguf` を探すフォルダ |
 | `LLM_MMPROJ` | 自動検出 | 画像入力に使う mmproj ファイルの明示指定 |
 | `LLM_N_CTX` | `8192` | コンテキスト長 (添付を使うと入力が伸びるため既定を広めに設定) |
+| `LLM_STDIO_ENCODING` | `utf-8` | ログ出力の文字コード。`none` で変更しない |
+
+### ログが文字化けするとき
+Windows の Python は既定でコンソールのコードページ (日本語環境なら cp932) で出力しますが、
+VS Code の統合ターミナルは出力を UTF-8 として解釈するため、日本語のログが化けます。
+起動時に stdout/stderr を UTF-8 へ切り替えて回避しています。
+
+素の PowerShell や コマンドプロンプト (cp932 のまま) で使っていて逆に化ける場合は、
+ターミナル側を UTF-8 にする (`chcp 65001`) か、次のように出力側を合わせてください。
+
+```powershell
+$env:LLM_STDIO_ENCODING="cp932"; python chat_app.py
+```
 
 ### ファイル添付
 入力欄の上にある「ファイル添付」から、次の送信に添付するファイルを選びます。
@@ -44,6 +57,15 @@ LLM_MODELS_DIR=/path/to/models python chat_app.py
 
 ライブラリが入っていない形式を選んだ場合は、必要な `pip install` を案内するだけで
 アプリは落ちません。1 ファイルあたりの取り込みは 6000 文字で打ち切ります。
+
+#### PDF を画像として読ませる
+PDF はまずテキスト抽出を試み、**文字が取れなかった場合 (スキャン PDF など) は
+自動でページ画像に変換**してモデルへ渡します。図表やレイアウトごと見せたいときは
+「PDFを画像として読む」にチェックを入れると、常にページ画像として渡します。
+
+画像化には `pypdfium2` と `pillow`、そして画像入力なので **mmproj が必要**です。
+1 ファイルにつき先頭 4 ページまで、144dpi 相当 (`PDF_IMAGE_MAX_PAGES` /
+`PDF_IMAGE_SCALE`) で変換します。
 
 **画像** (`.png` `.jpg` `.webp` など) を渡すには、マルチモーダル対応モデル (Gemma 4 等) と、
 対になる **mmproj ファイル** (`mmproj-*.gguf`) の両方が必要です。モデルと同じフォルダに

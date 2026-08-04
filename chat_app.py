@@ -22,6 +22,8 @@
   画像を渡すにはマルチモーダル対応モデル (Gemma 4 等) に加えて、対になる
   mmproj ファイル (mmproj-*.gguf) をモデルと同じフォルダに置く必要があります。
   文書ファイルはテキストへ変換して本文に埋め込むため、モデル側の対応は不要です。
+  PDF はテキスト優先で読み、抽出できない場合 (スキャン PDF 等) はページ画像に
+  変換して渡します。「PDFを画像として読む」で常に画像化することもできます。
 
 実行:
   python chat_app.py
@@ -96,8 +98,47 @@ DOC_LIBRARIES = {".pdf": "pypdf", ".docx": "python-docx", ".xlsx": "openpyxl", "
 # 1 ファイルあたり本文へ埋め込む最大文字数 (n_ctx を溢れさせないための保険)。
 MAX_DOC_CHARS = 6000
 
+# PDF をページ画像として渡すときの設定 (スキャン PDF や図表主体の資料向け)。
+PDF_IMAGE_SCALE = 2          # 1 = 72dpi 相当。2 で 144dpi
+PDF_IMAGE_MAX_PAGES = 4      # 1 ファイルから作る最大ページ数
+
 # 添付一覧ラベルに表示するファイル名の最大文字数
 ATTACH_LABEL_MAXLEN = 60
+
+# --------------------------------------------------------------------------
+# 標準出力の文字コード
+# --------------------------------------------------------------------------
+# Windows の Python は既定でコンソールのコードページ (日本語環境なら cp932) に
+# 合わせて出力するが、VS Code の統合ターミナルは UTF-8 として解釈するため、
+# 日本語のログが化ける。ここで出力側を UTF-8 に揃えて防ぐ。
+# cp932 のターミナル (素の PowerShell 等) で使う場合は LLM_STDIO_ENCODING=cp932、
+# 何もしてほしくない場合は LLM_STDIO_ENCODING=none を指定する。
+STDIO_ENCODING = os.environ.get("LLM_STDIO_ENCODING", "utf-8")
+
+
+def _configure_stdio_encoding():
+    """stdout/stderr の文字コードを揃える。変更内容を ASCII で返す (化けても読める)。"""
+    if STDIO_ENCODING.lower() in ("none", "off", ""):
+        return []
+    changes = []
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        current = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if current == STDIO_ENCODING.lower().replace("-", ""):
+            continue
+        try:
+            # errors="replace": 変換できない文字があっても落とさない
+            stream.reconfigure(encoding=STDIO_ENCODING, errors="replace")
+        except Exception as e:
+            changes.append(f"{name}: {current} -> {STDIO_ENCODING} FAILED ({e})")
+            continue
+        changes.append(f"{name}: {current} -> {STDIO_ENCODING}")
+    return changes
+
+
+_STDIO_CHANGES = _configure_stdio_encoding()
 
 # --------------------------------------------------------------------------
 # ロギング (ターミナルへのデバッグ出力)
@@ -109,6 +150,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("chat_app")
+
+for _change in _STDIO_CHANGES:
+    log.info("stdio encoding %s", _change)
 
 # --------------------------------------------------------------------------
 # llama-cpp-python (無ければモックモード)
@@ -229,6 +273,52 @@ def extract_document_text(path):
         log.warning("[添付] %s が長いため %d 文字を省略しました", path.name, omitted)
         text = text[:MAX_DOC_CHARS] + f"\n…(以降 {omitted} 文字を省略)"
     return text
+
+
+def render_pdf_pages(path, max_pages=PDF_IMAGE_MAX_PAGES, scale=PDF_IMAGE_SCALE):
+    """PDF の各ページを PNG に変換する。戻り値は [(ページ番号, PNG bytes), ...]。
+
+    テキストを持たないスキャン PDF や、図表・レイアウトごと見せたい資料向け。
+    """
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        raise RuntimeError("PDF の画像化には pypdfium2 が必要です (pip install pypdfium2)")
+
+    import io
+
+    try:
+        document = pdfium.PdfDocument(str(path))
+    except Exception as e:
+        raise RuntimeError(f"PDF を開けませんでした ({e})")
+    try:
+        total = len(document)
+        images = []
+        for index in range(min(total, max_pages)):
+            buffer = io.BytesIO()
+            document[index].render(scale=scale).to_pil().save(buffer, format="PNG")
+            images.append((index + 1, buffer.getvalue()))
+        if total > max_pages:
+            log.warning(
+                "[添付] %s は %d ページ中 %d ページのみ画像化しました",
+                path.name, total, max_pages,
+            )
+        return images
+    except ImportError:
+        raise RuntimeError("PDF の画像化には Pillow が必要です (pip install pillow)")
+    except Exception as e:
+        raise RuntimeError(f"ページを画像化できませんでした ({e})")
+    finally:
+        try:
+            document.close()
+        except Exception:
+            pass
+
+
+def image_attachment(name, data, mime="image/png"):
+    """画像バイト列を data URI 形式の添付エントリにする。"""
+    uri = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+    return {"kind": "image", "name": name, "data_uri": uri}
 
 
 def plain_content(content):
@@ -520,6 +610,12 @@ class ChatApp:
             attach_row, text="解除", command=self.on_clear_attachments, state="disabled"
         )
         self.attach_clear_btn.pack(side="left", padx=4)
+        # PDF は既定でテキスト優先 (抽出できなければ自動で画像化)。
+        # チェックすると常にページ画像として渡す (図表やレイアウトを見せたいとき)。
+        self.pdf_as_image_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            attach_row, text="PDFを画像として読む", variable=self.pdf_as_image_var
+        ).pack(side="left", padx=(8, 0))
         self.attach_var = tk.StringVar(value="添付なし")
         ttk.Label(attach_row, textvariable=self.attach_var, foreground="#666666").pack(
             side="left", padx=6
@@ -674,26 +770,56 @@ class ChatApp:
         for raw in paths:
             path = Path(raw)
             try:
-                self.attachments.append(self._make_attachment(path))
+                self.attachments.extend(self._make_attachments(path))
             except Exception as e:
                 log.warning("[添付] 追加できません: %s (%s)", path.name, e)
                 self._append_system(f"添付できません: {path.name} ({e})")
         self._refresh_attachments()
 
-    @staticmethod
-    def _make_attachment(path):
-        """パスから添付エントリを作る。読めない場合は例外を送出。"""
+    def _make_attachments(self, path):
+        """パスから添付エントリの一覧を作る。読めない場合は例外を送出。
+
+        PDF はページごとの画像になるため、1 ファイルから複数エントリができる。
+        """
         if not path.exists():
             raise RuntimeError("ファイルが見つかりません")
-        if path.suffix.lower() in IMAGE_SUFFIXES:
+
+        suffix = path.suffix.lower()
+        if suffix in IMAGE_SUFFIXES:
             data = path.read_bytes()
             mime = mimetypes.guess_type(path.name)[0] or "image/png"
-            uri = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
             log.info("[添付] 画像: %s (%.1f KB)", path.name, len(data) / 1024)
-            return {"kind": "image", "name": path.name, "data_uri": uri}
-        text = extract_document_text(path)
+            return [image_attachment(path.name, data, mime)]
+
+        if suffix == ".pdf" and self.pdf_as_image_var.get():
+            return self._pdf_page_attachments(path)
+
+        try:
+            text = extract_document_text(path)
+        except RuntimeError as e:
+            if suffix != ".pdf":
+                raise
+            # 文字を持たない PDF (スキャン画像など) は画像として渡す
+            log.info("[添付] %s はテキストを抽出できないため画像化します (%s)", path.name, e)
+            return self._pdf_page_attachments(path, reason=str(e))
+
         log.info("[添付] 文書: %s (%d 文字)", path.name, len(text))
-        return {"kind": "document", "name": path.name, "text": text}
+        return [{"kind": "document", "name": path.name, "text": text}]
+
+    def _pdf_page_attachments(self, path, reason=None):
+        """PDF をページ画像の添付エントリに変換する。
+
+        reason: テキストとして読めずに画像へ回ってきた場合の理由 (エラー文言に含める)。
+        """
+        if not self.engine.vision:
+            if reason:
+                raise RuntimeError(f"テキストとして読めず ({reason})、画像化には mmproj が必要です")
+            raise RuntimeError("画像として渡すには mmproj が必要です")
+        images = render_pdf_pages(path)
+        if not images:
+            raise RuntimeError("ページがありません")
+        log.info("[添付] PDF を画像化: %s (%d ページ)", path.name, len(images))
+        return [image_attachment(f"{path.name} p.{page}", data) for page, data in images]
 
     def on_clear_attachments(self):
         if self.generating or not self.attachments:
@@ -758,6 +884,11 @@ class ChatApp:
             return "break"
 
         content = self._build_content(text)
+        if isinstance(content, str) and not content.strip():
+            # 添付が全て除外された (画像を渡せない構成で画像だけ添付した等)
+            self._append_system("送信できる内容がありません")
+            return "break"
+
         self.input.delete("1.0", "end")
         self.attachments = []
         self._refresh_attachments()
