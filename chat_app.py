@@ -31,7 +31,8 @@
 
 実行:
   python chat_app.py
-  # モデルの置き場所を指定する場合:
+  # モデルの置き場所は UI の「フォルダ...」で選べば chat_settings.json に保存される。
+  # 一時的に別の場所を使いたい場合のみ環境変数で上書きする:
   LLM_MODELS_DIR=/path/to/models python chat_app.py
   # mmproj を明示指定する場合:
   LLM_MMPROJ=/path/to/mmproj-gemma-4-E4B.gguf python chat_app.py
@@ -55,6 +56,9 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog
 # 設定
 # --------------------------------------------------------------------------
 # モデル (.gguf) を置いているフォルダ。環境変数 LLM_MODELS_DIR で上書き可。
+# 優先順位は 環境変数 > 設定ファイル (chat_settings.json) > カレントディレクトリ。
+# 設定ファイルの値は起動時に読み込み、UI の「フォルダ...」で変更できる。
+MODELS_DIR_FROM_ENV = bool(os.environ.get("LLM_MODELS_DIR"))
 MODELS_DIR = Path(os.environ.get("LLM_MODELS_DIR", ".")).expanduser()
 
 # 会話履歴 (JSON) の保存先。スクリプトと同じ場所の chat_sessions/ 。
@@ -256,6 +260,26 @@ except Exception as exc:  # ImportError 等
     Llama = None
     HAS_LLAMA = False
     log.warning("llama-cpp-python を読み込めません (%s) -> モックモードで起動します", exc)
+
+
+def load_settings_file():
+    """設定ファイルを読む。無い / 壊れている場合は空の辞書を返す。"""
+    try:
+        return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log.info("[設定] 保存済みの設定はありません (既定値で起動)")
+        return {}
+    except Exception as e:
+        log.warning("[設定] 読み込みに失敗しました (%s) -> 既定値で起動", e)
+        return {}
+
+
+def set_models_dir(path):
+    """モデルフォルダを切り替える。"""
+    global MODELS_DIR
+    MODELS_DIR = Path(path).expanduser()
+    log.info("[設定] モデルフォルダ: %s", MODELS_DIR.resolve())
+    return MODELS_DIR
 
 
 def discover_models():
@@ -970,6 +994,13 @@ class ChatApp:
         self._answer_started = False   # 回答の最初のトークンを出したか
         self._thumbnails = []          # チャット欄に貼った画像 (GC されると消えるため保持)
 
+        # モデルフォルダは UI (モデル一覧) を組み立てる前に確定させる
+        saved_dir = load_settings_file().get("models_dir")
+        if saved_dir and MODELS_DIR_FROM_ENV:
+            log.info("[設定] LLM_MODELS_DIR が指定されているため、保存済みのフォルダは使いません")
+        elif saved_dir:
+            set_models_dir(saved_dir)
+
         self._build_ui()
         self._load_settings()
         self._refresh_sidebar()
@@ -1036,6 +1067,7 @@ class ChatApp:
         self.model_combo.pack(side="left", padx=4)
         self.load_btn = ttk.Button(top, text="読み込み", command=self.on_load)
         self.load_btn.pack(side="left", padx=4)
+        ttk.Button(top, text="フォルダ...", command=self.on_choose_models_dir).pack(side="left")
         self.status_var = tk.StringVar(value="未読み込み")
         ttk.Label(top, textvariable=self.status_var, foreground="#0066cc").pack(
             side="left", padx=8
@@ -1153,14 +1185,12 @@ class ChatApp:
         }
 
     def _load_settings(self):
-        """前回終了時の設定を復元する。無ければ既定値のまま。"""
-        try:
-            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            log.info("[設定] 保存済みの設定はありません (既定値で起動)")
-            return
-        except Exception as e:
-            log.warning("[設定] 読み込みに失敗しました (%s) -> 既定値で起動", e)
+        """前回終了時の設定を復元する。無ければ既定値のまま。
+
+        モデルフォルダだけは UI を組み立てる前に要るので、__init__ で先に反映済み。
+        """
+        data = load_settings_file()
+        if not data:
             return
         for key, (var, cast) in self._settings_fields().items():
             if key not in data:
@@ -1179,6 +1209,7 @@ class ChatApp:
     def _save_settings(self):
         """現在の設定を次回起動用に保存する。"""
         data = {key: cast(var.get()) for key, (var, cast) in self._settings_fields().items()}
+        data["models_dir"] = str(MODELS_DIR)
         try:
             SETTINGS_PATH.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1310,6 +1341,30 @@ class ChatApp:
         threading.Thread(
             target=self._load_worker, args=(name,), name="loader", daemon=True
         ).start()
+
+    def on_choose_models_dir(self):
+        """モデル (.gguf) を置いているフォルダを選び直す。設定ファイルにも保存する。"""
+        if self.generating:
+            return
+        chosen = filedialog.askdirectory(
+            title="モデルフォルダを選択", initialdir=str(MODELS_DIR)
+        )
+        if not chosen:
+            return
+        set_models_dir(chosen)
+        models = discover_models()
+        self.model_combo["values"] = models
+        if models:
+            self.model_combo.current(0)
+        else:
+            self.model_var.set("")
+        self._append_system(f"モデルフォルダ: {MODELS_DIR.resolve()} ({len(models)} 件)")
+        self._save_settings()
+        if MODELS_DIR_FROM_ENV:
+            self._append_system(
+                "環境変数 LLM_MODELS_DIR が設定されているため、"
+                "次回起動時はそちらが優先されます"
+            )
 
     def _load_worker(self, name):
         t0 = time.time()
