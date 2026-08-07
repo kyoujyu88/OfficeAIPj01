@@ -155,6 +155,9 @@ PDF_IMAGE_MAX_PAGES = 4      # 1 ファイルから作る最大ページ数
 # 添付一覧ラベルに表示するファイル名の最大文字数
 ATTACH_LABEL_MAXLEN = 60
 
+# チャット欄に貼る画像サムネイルの幅 (px)
+THUMBNAIL_WIDTH = 200
+
 # ---- カメラ --------------------------------------------------------------
 # 使うカメラの番号 (内蔵カメラは 0。外付けを使う場合は 1 以降)
 CAMERA_INDEX = int(os.environ.get("LLM_CAMERA_INDEX", 0))
@@ -453,6 +456,47 @@ def frame_to_preview(frame, width=CAMERA_PREVIEW_WIDTH):
     return base64.b64encode(encode_png(frame)).decode("ascii")
 
 
+def thumbnail_png(data, max_width=THUMBNAIL_WIDTH):
+    """画像バイト列を縮小した PNG にする。作れなければ None。
+
+    Pillow を優先し (GIF 等も読める)、無ければ OpenCV を使う。
+    どちらも無ければサムネイルを諦めるだけで、添付そのものには影響しない。
+    """
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as image:
+            image = image.convert("RGB")
+            if image.width > max_width:
+                height = max(1, round(image.height * max_width / image.width))
+                image = image.resize((max_width, height))
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return buffer.getvalue()
+    except Exception:
+        pass
+    try:
+        import cv2
+        import numpy as np
+
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        return encode_png(frame) if frame.shape[1] <= max_width else encode_png(
+            cv2.resize(frame, (max_width, max(1, round(frame.shape[0] * max_width / frame.shape[1]))))
+        )
+    except Exception:
+        log.debug("[表示] サムネイルを作れませんでした", exc_info=True)
+        return None
+
+
+def data_uri_bytes(uri):
+    """data URI から中身のバイト列を取り出す。"""
+    return base64.b64decode(uri.split(",", 1)[1])
+
+
 def image_attachment(name, data, mime="image/png"):
     """画像バイト列を data URI 形式の添付エントリにする。"""
     uri = f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
@@ -561,6 +605,23 @@ class ThoughtSplitter:
         out = [(kind, self.buffer)]
         self.buffer = ""
         return out
+
+
+def content_images(content):
+    """content に含まれる画像のバイト列を取り出す (チャット欄への表示用)。"""
+    if isinstance(content, str):
+        return []
+    images = []
+    for part in content or []:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            try:
+                data = data_uri_bytes(part["image_url"]["url"])
+            except Exception:
+                log.debug("[表示] 画像を取り出せませんでした", exc_info=True)
+                continue
+            if data:
+                images.append(data)
+    return images
 
 
 def plain_content(content):
@@ -894,6 +955,9 @@ class ChatApp:
         self.generating = False
         self._stop_event = threading.Event()   # 生成の打ち切り要求
         self._assistant_buf = ""       # ストリーミング中のアシスタント発話バッファ
+        self._in_thought = False       # 思考チャネルを表示中か
+        self._answer_started = False   # 回答の最初のトークンを出したか
+        self._thumbnails = []          # チャット欄に貼った画像 (GC されると消えるため保持)
 
         self._build_ui()
         self._load_settings()
@@ -1169,6 +1233,7 @@ class ChatApp:
         self.chat.config(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.config(state="disabled")
+        self._thumbnails = []
         self._refresh_regen_button()
 
     def _refresh_regen_button(self):
@@ -1418,7 +1483,7 @@ class ChatApp:
         self.attachments = []
         self._refresh_attachments()
         self.history.append({"role": "user", "content": content})
-        self._append_message("user", plain_content(content))
+        self._append_message("user", plain_content(content), content_images(content))
         log.info(
             "[UI] 送信: %d 文字 / 画像 %d 枚 / 履歴 %d 件",
             len(plain_content(content)),
@@ -1509,6 +1574,8 @@ class ChatApp:
         # 準備が済んでから UI を生成中の状態にする (通知が "AI:" の後に出ないように)
         self.generating = True
         self._stop_event.clear()
+        self._in_thought = False        # 思考チャネルを表示中か
+        self._answer_started = False    # 回答の最初のトークンを出したか
         self.send_btn.config(state="disabled")
         self.regen_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -1589,10 +1656,23 @@ class ChatApp:
             while True:
                 kind, payload = self.token_queue.get_nowait()
                 if kind == "answer":
+                    if not self._answer_started:
+                        # 思考の直後に回答が続くので、区切りを入れてから始める。
+                        # 区切りは思考タグを付ける -> 折りたたみ時に一緒に隠れる
+                        if self._in_thought:
+                            self._stream_token("\n", "thought")
+                            self._in_thought = False
+                        payload = payload.lstrip()   # 回答先頭の余分な改行を落とす
+                        if not payload:
+                            continue
+                        self._answer_started = True
                     self._assistant_buf += payload
                     self._stream_token(payload, "assistant")
                 elif kind == "thought":
                     # 思考は表示するだけで履歴には残さない (次のターンへは渡さない)
+                    if not self._in_thought:
+                        self._in_thought = True
+                        self._stream_token("[思考]\n", "thought")
                     self._stream_token(payload, "thought")
                 elif kind in ("end", "stopped"):
                     if self._assistant_buf:
@@ -1642,17 +1722,38 @@ class ChatApp:
         self.chat.config(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.config(state="disabled")
+        self._thumbnails = []          # 描き直すので古いサムネイルは捨てる
         for m in self.history:
-            self._append_message(m["role"], plain_content(m["content"]))
+            self._append_message(
+                m["role"], plain_content(m["content"]), content_images(m["content"])
+            )
 
-    def _append_message(self, role, text):
+    def _append_message(self, role, text, images=()):
         label = {"user": "あなた", "assistant": "AI"}.get(role, role)
         self.chat.config(state="normal")
         self.chat.insert("end", f"\n{label}: ", role)
         if text:
             self.chat.insert("end", text, role)
+        for data in images:
+            self._insert_thumbnail(data)
         self.chat.config(state="disabled")
         self.chat.see("end")
+
+    def _insert_thumbnail(self, data):
+        """チャット欄に画像を小さく貼る。作れなければ何もしない。"""
+        thumbnail = thumbnail_png(data)
+        if thumbnail is None:
+            return
+        try:
+            photo = tk.PhotoImage(data=base64.b64encode(thumbnail).decode("ascii"))
+        except Exception:
+            log.debug("[表示] サムネイルを表示できませんでした", exc_info=True)
+            return
+        # PhotoImage は参照が切れると表示が消えるため、アプリ側で持ち続ける
+        self._thumbnails.append(photo)
+        self.chat.insert("end", "\n")
+        self.chat.image_create("end", image=photo)
+        self.chat.insert("end", "\n")
 
     def _stream_token(self, piece, tag="assistant"):
         self.chat.config(state="normal")
