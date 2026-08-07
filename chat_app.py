@@ -518,11 +518,15 @@ def message_tokens(message, count_tokens):
 
 
 def strip_images(message):
-    """画像パートを外して本文だけにする。画像が無ければ元のまま返す。"""
+    """画像パートを外して本文だけにする。画像が無ければ元のまま返す。
+
+    画像を外した代わりに [添付画像: 名前] を残す。実体はもう渡らないので
+    二重に数えられる心配はなく、何があったかの手がかりだけが残る。
+    """
     content = message.get("content")
     if isinstance(content, str):
         return message
-    return dict(message, content=plain_content(content))
+    return dict(message, content=plain_content(content, with_images=True))
 
 
 def fit_to_budget(messages, budget, count_tokens):
@@ -624,15 +628,22 @@ def content_images(content):
     return images
 
 
-def plain_content(content):
-    """content (str または OpenAI 形式のパート配列) を表示・保存用の文字列にする。"""
+def plain_content(content, with_images=False):
+    """content (str または OpenAI 形式のパート配列) を文字列にする。
+
+    with_images=True のときだけ [添付画像: 名前] の行を足す (保存・タイトル用)。
+    モデルへ送る本文には入れない。画像そのものと二重に数えられてしまうため。
+    """
     if isinstance(content, str):
         return content
-    texts = [
-        part.get("text", "")
-        for part in (content or [])
-        if isinstance(part, dict) and part.get("type") == "text"
-    ]
+    texts = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            texts.append(part.get("text", ""))
+        elif with_images and part.get("type") == "image_url":
+            texts.append(f"[添付画像: {part.get('name', '画像')}]")
     return "\n".join(t for t in texts if t)
 
 
@@ -1181,7 +1192,7 @@ class ChatApp:
         """最初のユーザー発話から会話タイトルを作る。"""
         for m in self.history:
             if m["role"] == "user":
-                t = plain_content(m["content"]).strip().replace("\n", " ")
+                t = plain_content(m["content"], with_images=True).strip().replace("\n", " ")
                 return (t[:TITLE_MAXLEN] + "…") if len(t) > TITLE_MAXLEN else t
         return "新しいチャット"
 
@@ -1202,7 +1213,10 @@ class ChatApp:
             "thinking": bool(self.thinking_var.get()),
             # 画像は base64 のまま保存すると JSON が肥大するため、本文だけを残す。
             # (会話を再開すると画像はモデルに渡らず、[添付画像: 名前] の記述だけが残る)
-            "messages": [dict(m, content=plain_content(m["content"])) for m in self.history],
+            "messages": [
+                dict(m, content=plain_content(m["content"], with_images=True))
+                for m in self.history
+            ],
         })
 
     def _refresh_sidebar(self):
@@ -1449,14 +1463,16 @@ class ChatApp:
         blocks = [text] if text else []
         for doc in documents:
             blocks.append(f"--- 添付ファイル: {doc['name']} ---\n{doc['text']}\n--- ここまで ---")
-        blocks.extend(f"[添付画像: {img['name']}]" for img in images)
         merged = "\n\n".join(blocks)
 
         if not images:
             return merged
-        parts = [{"type": "text", "text": merged}]
+        # 画像は「本文で言及 + 画像そのもの」にすると 2 枚あると解釈されるため、
+        # 本文には書かず画像パートだけを渡す。名前は保存・表示用にパートへ持たせる。
+        parts = [{"type": "text", "text": merged}] if merged else []
         parts.extend(
-            {"type": "image_url", "image_url": {"url": img["data_uri"]}} for img in images
+            {"type": "image_url", "image_url": {"url": img["data_uri"]}, "name": img["name"]}
+            for img in images
         )
         return parts
 
