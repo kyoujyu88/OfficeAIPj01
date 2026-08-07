@@ -15,6 +15,7 @@
       * チェックを入れて選択した会話をまとめて削除
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
+  - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
   - ターミナルに動作状況 (状態遷移・性能) をデバッグ出力
 
 備考:
@@ -153,6 +154,14 @@ PDF_IMAGE_MAX_PAGES = 4      # 1 ファイルから作る最大ページ数
 
 # 添付一覧ラベルに表示するファイル名の最大文字数
 ATTACH_LABEL_MAXLEN = 60
+
+# ---- カメラ --------------------------------------------------------------
+# 使うカメラの番号 (内蔵カメラは 0。外付けを使う場合は 1 以降)
+CAMERA_INDEX = int(os.environ.get("LLM_CAMERA_INDEX", 0))
+# プレビューの表示幅 (px)。撮影される画像はカメラの解像度のまま。
+CAMERA_PREVIEW_WIDTH = 480
+# プレビューの更新間隔 (ミリ秒)
+CAMERA_POLL_MS = 33
 
 # --------------------------------------------------------------------------
 # 標準出力の文字コード
@@ -392,6 +401,56 @@ def render_pdf_pages(path, max_pages=PDF_IMAGE_MAX_PAGES, scale=PDF_IMAGE_SCALE)
             document.close()
         except Exception:
             pass
+
+
+# --------------------------------------------------------------------------
+# カメラ (OpenCV)
+# --------------------------------------------------------------------------
+def _require_cv2():
+    """OpenCV を遅延 import する。無ければ導入方法を添えて RuntimeError。"""
+    try:
+        import cv2
+    except ImportError:
+        raise RuntimeError("カメラを使うには opencv-python が必要です (pip install opencv-python)")
+    return cv2
+
+
+def open_camera(index=CAMERA_INDEX):
+    """カメラを開く。開けなければ RuntimeError。"""
+    cv2 = _require_cv2()
+    # Windows の既定 (MSMF) は起動が遅いことがあるため DirectShow を先に試す
+    backends = [cv2.CAP_DSHOW, cv2.CAP_ANY] if os.name == "nt" else [cv2.CAP_ANY]
+    for backend in backends:
+        capture = cv2.VideoCapture(index, backend)
+        if capture.isOpened():
+            log.info("[カメラ] index=%d backend=%d で開きました", index, backend)
+            return capture
+        capture.release()
+    raise RuntimeError(
+        f"カメラを開けません (index={index})。"
+        "他のアプリが使用中か、LLM_CAMERA_INDEX の指定を確認してください"
+    )
+
+
+def encode_png(frame):
+    """OpenCV のフレーム (BGR) を PNG バイト列にする。"""
+    cv2 = _require_cv2()
+    ok, buffer = cv2.imencode(".png", frame)
+    if not ok:
+        raise RuntimeError("画像の変換に失敗しました")
+    return buffer.tobytes()
+
+
+def frame_to_preview(frame, width=CAMERA_PREVIEW_WIDTH):
+    """プレビュー用に縮小し、tk.PhotoImage に渡せる base64 PNG にする。
+
+    Tk 8.6 の PhotoImage は PNG を直接読めるので、PIL に依存せず表示できる。
+    """
+    cv2 = _require_cv2()
+    height, current = frame.shape[:2]
+    if current > width:
+        frame = cv2.resize(frame, (width, max(1, round(height * width / current))))
+    return base64.b64encode(encode_png(frame)).decode("ascii")
 
 
 def image_attachment(name, data, mime="image/png"):
@@ -719,6 +778,105 @@ class LLMEngine:
 # --------------------------------------------------------------------------
 # GUI 本体
 # --------------------------------------------------------------------------
+class CameraWindow:
+    """カメラのプレビューを出し、撮影した画像を添付として渡す小窓。
+
+    読み取りは別スレッドで回し、UI 側は最新フレームを描くだけにする
+    (cap.read() は 30ms 程度ブロックするため、UI スレッドで回すと固まる)。
+    """
+
+    def __init__(self, parent, on_capture, index=CAMERA_INDEX):
+        self.on_capture = on_capture
+        self.capture = open_camera(index)       # 失敗時はここで例外 -> 呼び出し側で表示
+        self._frame = None                      # 最新フレーム (別スレッドが更新)
+        self._lock = threading.Lock()
+        self._closing = threading.Event()
+        self._photo = None                      # PhotoImage は参照を保持しないと消える
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("カメラ")
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.preview = ttk.Label(self.window)
+        self.preview.pack(padx=8, pady=8)
+
+        row = ttk.Frame(self.window, padding=(8, 0, 8, 8))
+        row.pack(fill="x")
+        ttk.Button(row, text="撮影", command=self.capture_frame).pack(side="left")
+        self.mirror_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="左右反転", variable=self.mirror_var).pack(side="left", padx=8)
+        ttk.Button(row, text="閉じる", command=self.close).pack(side="right")
+        self.status_var = tk.StringVar(value="プレビュー中 ...")
+        ttk.Label(self.window, textvariable=self.status_var, foreground="#666666").pack(
+            anchor="w", padx=8, pady=(0, 8)
+        )
+
+        self._reader = threading.Thread(target=self._read_loop, name="camera", daemon=True)
+        self._reader.start()
+        self.window.after(CAMERA_POLL_MS, self._update_preview)
+
+    def _read_loop(self):
+        """カメラから読み続けて、最新フレームだけ持っておく。"""
+        while not self._closing.is_set():
+            ok, frame = self.capture.read()
+            if not ok:
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                self._frame = frame
+
+    def _current_frame(self):
+        with self._lock:
+            frame = self._frame
+        if frame is None:
+            return None
+        if self.mirror_var.get():
+            frame = frame[:, ::-1]              # 左右反転 (プレビューと撮影で揃える)
+        return frame
+
+    def _update_preview(self):
+        if self._closing.is_set():
+            return
+        frame = self._current_frame()
+        if frame is not None:
+            try:
+                self._photo = tk.PhotoImage(data=frame_to_preview(frame))
+                self.preview.config(image=self._photo)
+            except Exception:
+                log.exception("[カメラ] プレビューの描画に失敗")
+        self.window.after(CAMERA_POLL_MS, self._update_preview)
+
+    def capture_frame(self):
+        """今のフレームを PNG にして添付へ渡す。"""
+        frame = self._current_frame()
+        if frame is None:
+            self.status_var.set("まだ映像を取得できていません")
+            return
+        try:
+            data = encode_png(frame)
+        except Exception as e:
+            log.exception("[カメラ] 撮影に失敗")
+            self.status_var.set(f"撮影に失敗しました ({e})")
+            return
+        name = time.strftime("camera_%Y%m%d_%H%M%S.png")
+        log.info("[カメラ] 撮影: %s (%d x %d, %.1f KB)",
+                 name, frame.shape[1], frame.shape[0], len(data) / 1024)
+        self.on_capture(image_attachment(name, data))
+        self.status_var.set(f"添付しました: {name}")
+
+    def close(self):
+        if self._closing.is_set():
+            return
+        self._closing.set()
+        self._reader.join(timeout=1.0)
+        try:
+            self.capture.release()
+        except Exception:
+            pass
+        log.info("[カメラ] 終了")
+        self.window.destroy()
+
+
 class ChatApp:
     def __init__(self, root):
         self.root = root
@@ -727,6 +885,7 @@ class ChatApp:
 
         self.history = []              # [{"role": ..., "content": ...}]
         self.attachments = []          # 次の送信に添付するファイル [{kind, name, ...}]
+        self.camera_window = None      # 開いているカメラ小窓 (無ければ None)
         self.current_id = None         # 現在の会話 ID (未保存なら None)
         self.current_created = None    # 現在の会話の作成時刻
         self.session_rows = []         # サイドバー行 [(BooleanVar, meta), ...]
@@ -867,6 +1026,8 @@ class ChatApp:
         attach_row.pack(fill="x", pady=(0, 4))
         self.attach_btn = ttk.Button(attach_row, text="ファイル添付", command=self.on_attach)
         self.attach_btn.pack(side="left")
+        self.camera_btn = ttk.Button(attach_row, text="カメラ", command=self.on_camera)
+        self.camera_btn.pack(side="left", padx=4)
         self.attach_clear_btn = ttk.Button(
             attach_row, text="解除", command=self.on_clear_attachments, state="disabled"
         )
@@ -1152,6 +1313,39 @@ class ChatApp:
         log.info("[添付] PDF を画像化: %s (%d ページ)", path.name, len(images))
         return [image_attachment(f"{path.name} p.{page}", data) for page, data in images]
 
+    def on_camera(self):
+        """カメラ小窓を開く。撮影した画像はそのまま添付に入る。"""
+        if self.generating:
+            return
+        if getattr(self, "camera_window", None) is not None:
+            # すでに開いていれば前面に出すだけ
+            try:
+                self.camera_window.window.lift()
+                return
+            except Exception:
+                self.camera_window = None
+        if not self.engine.vision:
+            self._append_system(
+                "このモデル構成では画像を渡せません (mmproj 未検出)。撮影はできますが送信時に外されます"
+            )
+        try:
+            self.camera_window = CameraWindow(self.root, self._on_camera_capture)
+        except Exception as e:
+            log.warning("[カメラ] 起動できません (%s)", e)
+            self._append_system(f"カメラを開けません: {e}")
+            self.camera_window = None
+            return
+        self.camera_window.window.bind("<Destroy>", self._on_camera_closed)
+
+    def _on_camera_capture(self, attachment):
+        self.attachments.append(attachment)
+        self._refresh_attachments()
+
+    def _on_camera_closed(self, event):
+        # Toplevel の子ウィジェットの Destroy でも呼ばれるため、本体か確認する
+        if self.camera_window is not None and event.widget is self.camera_window.window:
+            self.camera_window = None
+
     def on_clear_attachments(self):
         if self.generating or not self.attachments:
             return
@@ -1374,6 +1568,13 @@ class ChatApp:
 
     def on_close(self):
         """ウィンドウを閉じる前に現在の会話と設定を保存。"""
+        if self.camera_window is not None:
+            # カメラを掴んだままだと他アプリから使えなくなるので必ず離す
+            try:
+                self.camera_window.close()
+            except Exception:
+                log.exception("[カメラ] 終了処理に失敗")
+            self.camera_window = None
         try:
             self._save_current()
             self._save_settings()
