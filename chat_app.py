@@ -86,7 +86,33 @@ MMPROJ_OVERRIDE = os.environ.get("LLM_MMPROJ")
 # 添付ファイルや思考モードで入力・出力とも長くなるため、環境変数で調整できる。
 DEFAULT_N_CTX = int(os.environ.get("LLM_N_CTX", 16384))
 DEFAULT_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", 2048))
-DEFAULT_N_THREADS = int(os.environ.get("LLM_N_THREADS", 0)) or os.cpu_count() or 4
+
+
+def _physical_cores():
+    """物理コア数。分からなければ論理コア数。"""
+    try:
+        import psutil
+
+        return psutil.cpu_count(logical=False) or os.cpu_count() or 4
+    except Exception:
+        return os.cpu_count() or 4
+
+
+# スレッド数。トークン生成はメモリ帯域で頭打ちになるため、ハイパースレッドの分まで
+# 増やしても速くならず、かえって遅くなることがある -> 生成は物理コア数。
+# 入力の読み込み (prefill) は計算量で決まるので論理コア数まで使う。
+DEFAULT_N_THREADS = int(os.environ.get("LLM_N_THREADS", 0)) or _physical_cores()
+DEFAULT_N_THREADS_BATCH = int(os.environ.get("LLM_N_THREADS_BATCH", 0)) or os.cpu_count() or 4
+
+# ---- 速度向上の設定 ------------------------------------------------------
+# Flash Attention: 注意機構の計算をまとめて行い、長い入力の読み込みを速くする。
+# KV キャッシュの量子化 (q8_0) にも必要。読み込みに失敗した場合は自動で外して読み直す。
+FLASH_ATTN = os.environ.get("LLM_FLASH_ATTN", "1").lower() not in ("0", "false", "off", "no")
+# KV キャッシュの型。q8_0 にするとメモリが半分になり、長い会話での読み書きが軽くなる
+# (品質への影響はごく小さい)。f16 で従来どおり。Flash Attention が無効なら f16 になる。
+KV_CACHE_TYPE = os.environ.get("LLM_KV_TYPE", "q8_0").lower()
+# ggml の型番号 (llama_cpp.GGML_TYPE_* と同じ値)
+GGML_TYPES = {"f16": 1, "q4_0": 2, "q8_0": 8}
 
 # 履歴をモデルへ送るときの予算計算。
 # チャットテンプレートの制御トークン等のぶんを余白として引いておく。
@@ -711,6 +737,13 @@ class ThoughtSplitter:
         return out
 
 
+def content_images_count(content):
+    """content に含まれる画像パートの数。"""
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+
+
 def content_images(content):
     """content に含まれる画像のバイト列を取り出す (チャット欄への表示用)。"""
     if isinstance(content, str):
@@ -1289,6 +1322,13 @@ class LLMEngine:
         self.load_error = None      # 直近のロード失敗理由 (成功/モック時は None)
         self.vision = False         # 画像入力が使えるか (mmproj を読み込めた場合のみ True)
         self.last_finish_reason = None   # 直近の生成の終了理由 ("length" なら打ち切り)
+        # 画像用の chat handler (mmproj 使用時)。画像を含まないターンでは外して
+        # テキスト用の経路を使う (前回までの計算結果を再利用できるため。stream 参照)
+        self._vision_handler = None
+        self._text_path = False     # テキスト用の経路に切り替えられるか
+        self._kv_from_vision = False    # 直前の生成が画像用の経路だったか
+        self.last_path = None       # 直近の生成で使った経路 ("text" / "vision")
+        self.speed_options = {}     # 読み込みに使えた速度向上の設定
 
     def load(self, model_name, n_ctx=DEFAULT_N_CTX, n_threads=DEFAULT_N_THREADS):
         """モデルを読み込む。成功で True、モックで False を返す。
@@ -1306,17 +1346,32 @@ class LLMEngine:
             log.warning("モックモードでロード: %s (%s)", model_name, reason)
             return False
 
-        log.info("モデル読み込み開始: %s (n_ctx=%d, n_threads=%d)", model_name, n_ctx, n_threads)
+        log.info(
+            "モデル読み込み開始: %s (n_ctx=%d, n_threads=%d, n_threads_batch=%d)",
+            model_name, n_ctx, n_threads, DEFAULT_N_THREADS_BATCH,
+        )
         t0 = time.time()
         chat_handler = self._build_chat_handler()
+        base = dict(
+            model_path=str(path),
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            n_threads_batch=DEFAULT_N_THREADS_BATCH,
+            chat_handler=chat_handler,
+            verbose=False,
+        )
+        fast = self._fast_options()
         try:
-            llm = Llama(
-                model_path=str(path),
-                n_ctx=n_ctx,
-                n_threads=n_threads,
-                chat_handler=chat_handler,
-                verbose=False,
-            )
+            try:
+                llm = Llama(**base, **fast)
+            except Exception:
+                if not fast:
+                    raise
+                # 古いビルド等で速度向上の設定が使えない場合は、外して読み直す
+                log.warning("速度向上の設定 %s で読み込めないため、外して読み直します", fast,
+                            exc_info=True)
+                llm = Llama(**base)
+                fast = {}
         except Exception as e:
             # 失敗理由を残しておき、モック応答へ暗黙に落ちないようにする。
             self.llm = None
@@ -1329,11 +1384,48 @@ class LLMEngine:
         self.model_name = model_name
         self.load_error = None
         self.vision = chat_handler is not None
+        self._setup_text_path(chat_handler)
+        self.speed_options = fast
         log.info(
-            "モデル読み込み完了: %.1f 秒 (画像入力 %s)",
-            time.time() - t0, "有効" if self.vision else "無効",
+            "モデル読み込み完了: %.1f 秒 (画像入力 %s, 速度設定 %s, テキスト経路の切り替え %s)",
+            time.time() - t0, "有効" if self.vision else "無効", fast or "なし",
+            "可" if self._text_path else "不要" if not self.vision else "不可",
         )
         return True
+
+    @staticmethod
+    def _fast_options():
+        """Flash Attention と KV キャッシュの量子化の設定。"""
+        if not FLASH_ATTN:
+            return {}
+        options = {"flash_attn": True}
+        kv_type = GGML_TYPES.get(KV_CACHE_TYPE)
+        if kv_type is None:
+            log.warning("LLM_KV_TYPE=%s は未対応です (f16 / q8_0 / q4_0) -> f16", KV_CACHE_TYPE)
+        elif KV_CACHE_TYPE != "f16":
+            options.update(type_k=kv_type, type_v=kv_type)
+        return options
+
+    def _setup_text_path(self, chat_handler):
+        """画像用の handler を使う場合に、テキスト用の経路へ切り替えられるようにする。
+
+        llama-cpp-python の画像用 handler (MTMDChatHandler) は、毎回 KV キャッシュを消して
+        会話全体を読み直す。テキスト用の経路 (GGUF 内のチャットテンプレート) なら、前回と
+        共通する先頭部分の計算結果を再利用し、新しく増えた部分だけを読む。
+        両者は同じ tokenizer.chat_template を同じ Jinja 設定で描くので、プロンプトは変わらない。
+        """
+        self._vision_handler = chat_handler
+        self._kv_from_vision = False
+        self._text_path = False
+        if chat_handler is None:
+            return
+        handlers = getattr(self.llm, "_chat_handlers", None) or {}
+        if "chat_template.default" in handlers:
+            # chat_handler を外したときに、こちらのテンプレートが使われるようにしておく
+            self.llm.chat_format = "chat_template.default"
+            self._text_path = True
+        else:
+            log.info("GGUF にチャットテンプレートが無いため、常に画像用の経路で生成します")
 
     @staticmethod
     def _build_chat_handler():
@@ -1371,17 +1463,50 @@ class LLMEngine:
                 raise RuntimeError(f"モデルが読み込まれていません: {self.load_error}")
             yield from self._mock_stream(messages, response_format)
             return
-        extra = {"response_format": response_format} if response_format else {}
-        completion = self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            stop=stop_words_for(self.model_name),
-            stream=True,
-            **extra,
+        kwargs = dict(
+            messages=messages, max_tokens=max_tokens, temperature=temperature,
+            top_p=top_p, top_k=top_k, stop=stop_words_for(self.model_name), stream=True,
         )
+        if response_format:
+            kwargs["response_format"] = response_format
+
+        use_text = (
+            self._vision_handler is not None and self._text_path
+            and not any(content_images_count(m.get("content")) for m in messages)
+        )
+        if self._vision_handler is not None:
+            if use_text:
+                self.llm.chat_handler = None
+                if self._kv_from_vision:
+                    # 画像用の経路が残した KV キャッシュには画像の埋め込みが混ざっており、
+                    # 先頭一致の判定に使えない。一度だけ全体を読み直す
+                    self.llm.reset()
+                    self._kv_from_vision = False
+            else:
+                self.llm.chat_handler = self._vision_handler
+                self._kv_from_vision = True
+        self.last_path = "vision" if self._vision_handler is not None and not use_text else "text"
+        log.info("[GEN] 経路: %s", "テキスト (前回までの計算を再利用)" if self.last_path == "text"
+                 else "画像用 (会話全体を読み直し)")
+
+        started = False
+        try:
+            for piece in self._completion_pieces(kwargs):
+                started = True
+                yield piece
+        except Exception:
+            if not use_text or started:
+                raise
+            # テキスト用の経路で描けないテンプレートだった等。以後は画像用の経路だけを使う
+            log.warning("テキスト用の経路で生成できないため、画像用の経路に戻します", exc_info=True)
+            self._text_path = False
+            self.llm.chat_handler = self._vision_handler
+            self._kv_from_vision = True
+            self.last_path = "vision"
+            yield from self._completion_pieces(kwargs)
+
+    def _completion_pieces(self, kwargs):
+        completion = self.llm.create_chat_completion(**kwargs)
         for chunk in completion:
             choice = chunk["choices"][0]
             # "length" なら max_tokens 到達で打ち切られている (回答が途中で切れる原因)
@@ -1734,12 +1859,14 @@ class ChatApp:
         }
 
         self.style.configure("Muted.TLabel", foreground=COLORS["muted"])
-        # 入力欄の中に重ねる案内文 (入力欄と同じ背景にする)
-        self.style.configure("Hint.TLabel", foreground=COLORS["muted"], background=COLORS["bg"])
+        # 入力欄の中に出す案内文 (灰色の文字)
+        self.style.configure("Hint.TEntry", foreground=COLORS["muted"])
         self.style.configure("Accent.TButton", font=self.fonts["ui_bold"])
         for kind in ("ok", "warn", "error", "muted"):
             self.style.configure(f"State{kind.title()}.TLabel", foreground=COLORS[kind])
-        self.style.configure("Treeview", rowheight=26)
+        # 行の高さは文字の高さに合わせる (固定値だと高 DPI や大きいフォントで文字が切れる)
+        linespace = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        self.style.configure("Treeview", rowheight=max(24, linespace + 8))
 
     def _build_vars(self):
         """UI の状態を持つ変数。設定ファイルとの読み書きにも使う。"""
@@ -1833,10 +1960,13 @@ class ChatApp:
         ).pack(fill="x")
 
         ttk.Label(parent, text="会話履歴", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
-        search = ttk.Entry(parent, textvariable=self.search_var)
+        # 表示用の変数と、絞り込みに使う本当の値 (search_var) を分けておく
+        # (案内文を入力欄の中に出すため。案内文で絞り込まないように)
+        search_text = tk.StringVar(value="")
+        search = ttk.Entry(parent, textvariable=search_text)
         search.pack(fill="x", pady=(0, 4))
         self.search_var.trace_add("write", lambda *a: self._refresh_sidebar())
-        self._add_entry_hint(search, self.search_var, "タイトルで絞り込み")
+        self._add_entry_hint(search, search_text, self.search_var, "タイトルで絞り込み")
 
         wrap = ttk.Frame(parent)
         wrap.pack(fill="both", expand=True)
@@ -2076,21 +2206,54 @@ class ChatApp:
         """右クリックのイベント名 (macOS は Button-2)。"""
         return "<Button-2>" if sys.platform == "darwin" else "<Button-3>"
 
-    def _add_entry_hint(self, entry, var, hint):
-        """ttk.Entry に案内文を出す (未入力かつフォーカスが無いとき)。"""
-        label = ttk.Label(entry, text=hint, style="Hint.TLabel", cursor="xterm")
-        label.bind("<Button-1>", lambda e: entry.focus_set())
+    def _add_entry_hint(self, entry, text_var, value_var, hint):
+        """ttk.Entry の中に灰色の案内文を出す (未入力かつフォーカスが無いとき)。
 
-        def update(*_):
-            if var.get() or entry.focus_get() is entry:
-                label.place_forget()
-            else:
-                label.place(x=4, rely=0.5, anchor="w")
+        以前は Entry の上に Label を重ねていたが、フォントや DPI によって Label が
+        入力欄の枠からはみ出したため、案内文そのものを入力欄の文字として出す。
+        text_var は入力欄に表示する文字、value_var は実際の値 (案内文中は空)。
+        """
+        state = {"hint": False}
 
-        entry.bind("<FocusIn>", update, add="+")
-        entry.bind("<FocusOut>", update, add="+")
-        var.trace_add("write", update)
-        update()
+        def focused():
+            try:
+                return entry.focus_get() is entry
+            except Exception:      # コンボボックスの一覧を開いている間などは取得できない
+                return False
+
+        def show(*_):
+            if state["hint"] or text_var.get() or focused():
+                return
+            state["hint"] = True
+            text_var.set(hint)
+            entry.configure(style="Hint.TEntry")
+
+        def hide(*_):
+            if not state["hint"]:
+                return
+            state["hint"] = False
+            text_var.set("")
+            entry.configure(style="TEntry")
+
+        def on_text(*_):
+            if not state["hint"] and value_var.get() != text_var.get():
+                value_var.set(text_var.get())
+
+        def on_value(*_):
+            # プログラムから値を変えた場合も表示を合わせる
+            value = value_var.get()
+            if state["hint"] and value:
+                hide()
+            if not state["hint"] and text_var.get() != value:
+                text_var.set(value)
+            if not value:
+                show()
+
+        entry.bind("<FocusIn>", hide, add="+")
+        entry.bind("<FocusOut>", show, add="+")
+        text_var.trace_add("write", on_text)
+        value_var.trace_add("write", on_value)
+        show()
 
     def _show_placeholder(self):
         """入力欄が空なら案内文を出す。"""
@@ -2950,7 +3113,9 @@ class ChatApp:
             )
             self.token_queue.put((
                 "stopped" if stopped else "end",
-                {"tokens": n, "speed": speed, "finish": finish},
+                {"tokens": n, "speed": speed, "finish": finish,
+                 # 入力の読み込みにかかった時間 (送信してから最初の文字が出るまで)
+                 "wait": (first - t0) if first else None},
             ))
         except Exception as e:  # 推論中の例外もターミナルに出す
             log.exception("[GEN] 生成中にエラー")
@@ -3024,8 +3189,10 @@ class ChatApp:
                         )
                     else:
                         label = "完了"
+                    wait = payload.get("wait")
                     self._finish_generation(
-                        f"{label} ({payload['tokens']} tokens, {payload['speed']:.1f} tok/s)"
+                        f"{label} ({payload['tokens']} tokens, {payload['speed']:.1f} tok/s"
+                        + (f", 応答開始まで {wait:.1f} 秒" if wait is not None else "") + ")"
                     )
                     self._save_current()        # 1往復ごとに自動保存
                     self._refresh_sidebar()
