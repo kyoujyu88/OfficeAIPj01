@@ -2,6 +2,8 @@
 
 オフライン・CPU 環境向けの、ローカル LLM 活用プロジェクト。
 
+開発の経緯・設計判断・未着手のテーマは [HANDOVER.md](HANDOVER.md) にまとめています。
+
 ## chat_app.py — ローカルLLM チャットアプリ (Tkinter)
 
 Python 標準ライブラリ (Tkinter) だけで動く、エージェント的に拡張可能なチャット UI。
