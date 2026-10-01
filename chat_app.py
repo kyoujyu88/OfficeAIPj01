@@ -15,7 +15,8 @@
       * Ctrl・Shift + クリックで複数選択してまとめて削除
   - サンプリング等は折りたたみ式の詳細設定パネルに収納 (開閉状態は保存)
   - キーボードショートカット (Esc で停止、Ctrl+N 新規、Ctrl +/- で文字サイズ 等)
-  - 回答をファイルに保存 (回答全体を .md、またはコードブロック単体を言語に合った拡張子で)
+  - 回答をファイルに保存 (回答全体を .md / Word、表を Excel、コードブロック単体を言語に合った拡張子で)
+  - 出力形式「Excel 表」「Word 文書」: モデルの出力を JSON スキーマで縛り、アプリが .xlsx / .docx に変換
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
@@ -41,16 +42,22 @@
   LLM_MMPROJ=/path/to/mmproj-gemma-4-E4B.gguf python chat_app.py
 """
 
+import io
 import os
+import re
 import sys
+import csv
 import json
 import time
 import queue
 import base64
 import logging
 import mimetypes
+import zipfile
 import threading
+import unicodedata
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
@@ -779,6 +786,458 @@ def save_text_file(path, text):
 
 
 # --------------------------------------------------------------------------
+# Excel / Word への書き出し
+# --------------------------------------------------------------------------
+# 表と文書は共通の形で扱う。
+#   表:   {"title": str, "columns": [str, ...], "rows": [[str, ...], ...]}
+#   文書: {"title": str, "blocks": [{"type": ..., "text": str, ...}, ...]}
+#         type は heading (level 付き) / paragraph / bullet / number / code / table
+#         (table は {"type": "table", "table": 表})
+# どちらも「モデルに JSON で出させたもの」と「Markdown の回答から取り出したもの」の
+# 両方から作る。書き出しはアプリが行い、モデルにファイル形式そのものは書かせない。
+
+# 出力形式の選択肢 {表示名: 種別}。None は通常のチャット
+OUTPUT_MODES = {"チャット": None, "Excel 表": "table", "Word 文書": "document"}
+
+# モデルの出力を縛る JSON スキーマ (llama-cpp-python が文法に変換して強制する)。
+# 小さなモデルでも崩れにくいよう、セルは文字列だけにして数値化はアプリ側で行う。
+TABLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "columns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+    },
+    "required": ["title", "columns", "rows"],
+}
+DOCUMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "blocks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["heading", "paragraph", "bullet"]},
+                    "text": {"type": "string"},
+                },
+                "required": ["type", "text"],
+            },
+        },
+    },
+    "required": ["title", "blocks"],
+}
+STRUCTURED_SCHEMAS = {"table": TABLE_SCHEMA, "document": DOCUMENT_SCHEMA}
+
+# 形式を縛るだけだと各項目の意味が伝わらないため、システムプロンプトにも説明を足す
+STRUCTURED_INSTRUCTIONS = {
+    "table": (
+        "回答は表データとして、JSON だけを出力してください。"
+        "title は表の題名、columns は列見出しの配列、rows は各行のセルの配列です。"
+        "各行のセルの数は columns と同じにし、数値も文字列で書いてください。"
+    ),
+    "document": (
+        "回答は文書として、JSON だけを出力してください。"
+        "title は文書の題名、blocks は本文を上から順に並べた配列です。"
+        "type は heading (見出し) / paragraph (段落) / bullet (箇条書きの 1 項目) のいずれかで、"
+        "text にその文章を書きます。"
+    ),
+}
+
+# Excel の数値として扱う文字列 (先頭が 0 の番号やコードは文字列のまま残す)
+_NUMBER_RE = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?$")
+_GROUPED_NUMBER_RE = re.compile(r"^-?[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?$")
+# XML に入れられない制御文字
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Markdown の表の区切り行 (| --- | :---: |)
+_TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$")
+
+
+def parse_structured(kind, text):
+    """モデルが出した JSON を読み、表 / 文書の形に整える。読めなければ ValueError。"""
+    text = (text or "").strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # 前後に説明文やコードブロックの記号が付いた場合に備え、{ ... } の範囲だけ読み直す
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("JSON が見つかりません")
+        try:
+            data = json.loads(text[start:end + 1])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON として読めません ({e.msg})") from None
+    if not isinstance(data, dict):
+        raise ValueError("JSON の形が想定と違います")
+    title = str(data.get("title") or "").strip()
+
+    if kind == "table":
+        columns = [str(c) for c in data.get("columns") or []]
+        if not columns:
+            raise ValueError("列見出しがありません")
+        rows = []
+        for row in data.get("rows") or []:
+            cells = [str(c) for c in row] if isinstance(row, list) else [str(row)]
+            # セル数を列数にそろえる (多ければ切り、少なければ空欄で埋める)
+            rows.append((cells + [""] * len(columns))[:len(columns)])
+        return {"title": title, "columns": columns, "rows": rows}
+
+    blocks = []
+    for block in data.get("blocks") or []:
+        if not isinstance(block, dict):
+            continue
+        kind_ = block.get("type")
+        text_ = str(block.get("text") or "").strip()
+        if not text_:
+            continue
+        if kind_ == "heading":
+            blocks.append({"type": "heading", "level": 1, "text": text_})
+        elif kind_ == "bullet":
+            blocks.append({"type": "bullet", "text": text_})
+        else:
+            blocks.append({"type": "paragraph", "text": text_})
+    if not title and not blocks:
+        raise ValueError("本文がありません")
+    return {"title": title, "blocks": blocks}
+
+
+def _markdown_cell(text):
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def table_to_markdown(table):
+    lines = ["| " + " | ".join(_markdown_cell(c) for c in table["columns"]) + " |",
+             "| " + " | ".join("---" for _ in table["columns"]) + " |"]
+    lines += ["| " + " | ".join(_markdown_cell(c) for c in row) + " |" for row in table["rows"]]
+    return "\n".join(lines)
+
+
+def structured_to_markdown(kind, data):
+    """表 / 文書を Markdown にする (画面表示と会話履歴用。後から .md でも保存できる)。"""
+    parts = []
+    if kind == "table":
+        if data["title"]:
+            parts.append(f"**{data['title']}**")
+        parts.append(table_to_markdown(data))
+        return "\n\n".join(parts)
+    if data["title"]:
+        parts.append(f"# {data['title']}")
+    for block in data["blocks"]:
+        if block["type"] == "heading":
+            parts.append("#" * (block.get("level", 1) + 1) + " " + block["text"])
+        elif block["type"] == "bullet":
+            parts.append(f"- {block['text']}")
+        else:
+            parts.append(block["text"])
+    return "\n\n".join(parts)
+
+
+def _split_table_row(line):
+    """Markdown の表の 1 行をセルに分ける (\\| はセル内の | として扱う)。"""
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    cells = re.split(r"(?<!\\)\|", line)
+    return [_strip_inline(c.strip().replace("\\|", "|")) for c in cells]
+
+
+def _strip_inline(text):
+    """**太字** や `コード` などの記号を外す (Excel / Word には素の文字で入れる)。"""
+    text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text
+
+
+def _table_from_lines(lines):
+    """Markdown の表の行 (見出し・区切り・本文) から表を作る。形が違えば None。"""
+    if len(lines) < 2 or not _TABLE_SEPARATOR_RE.match(lines[1].strip()):
+        return None
+    columns = _split_table_row(lines[0])
+    rows = [(_split_table_row(l) + [""] * len(columns))[:len(columns)] for l in lines[2:]]
+    return {"title": "", "columns": columns, "rows": rows}
+
+
+def extract_tables(text):
+    """回答から表を取り出す: Markdown の表 (先) と、```csv / ```tsv のコードブロック (後)。"""
+    tables = [b["table"] for b in markdown_to_document(text)["blocks"] if b["type"] == "table"]
+    for lang, body in extract_code_blocks(text):
+        if lang in ("csv", "tsv"):
+            rows = [r for r in csv.reader(io.StringIO(body), delimiter="\t" if lang == "tsv" else ",") if r]
+            if rows:
+                width = max(len(r) for r in rows)
+                tables.append({
+                    "title": "", "columns": (rows[0] + [""] * width)[:width],
+                    "rows": [(r + [""] * width)[:width] for r in rows[1:]],
+                })
+    return tables
+
+
+def markdown_to_document(text):
+    """Markdown の回答を文書の形にする (見出し・段落・箇条書き・表・コード)。"""
+    blocks = []
+    paragraph = []
+    lines = (text or "").splitlines()
+
+    def flush():
+        if paragraph:
+            blocks.append({"type": "paragraph", "text": _strip_inline("\n".join(paragraph))})
+            paragraph.clear()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            flush()
+            fence, code = stripped[:3], []
+            i += 1
+            while i < len(lines) and lines[i].strip() != fence:
+                code.append(lines[i])
+                i += 1
+            blocks.append({"type": "code", "text": "\n".join(code)})
+        elif stripped.startswith("|"):
+            flush()
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+            table = _table_from_lines(table_lines)
+            if table:
+                blocks.append({"type": "table", "table": table})
+            else:
+                blocks.append({"type": "paragraph", "text": "\n".join(table_lines)})
+            continue
+        elif re.match(r"^#{1,6}\s", stripped):
+            flush()
+            level = len(stripped) - len(stripped.lstrip("#"))
+            blocks.append({"type": "heading", "level": level,
+                           "text": _strip_inline(stripped[level:].strip())})
+        elif re.match(r"^[-*+]\s", stripped):
+            flush()
+            blocks.append({"type": "bullet", "text": _strip_inline(stripped[2:].strip())})
+        elif re.match(r"^\d+[.)]\s", stripped):
+            flush()
+            blocks.append({"type": "number",
+                           "text": _strip_inline(re.sub(r"^\d+[.)]\s", "", stripped))})
+        elif not stripped or re.match(r"^(-{3,}|\*{3,})$", stripped):
+            flush()
+        else:
+            paragraph.append(stripped)
+        i += 1
+    flush()
+
+    # 先頭が見出しなら文書の題名にする
+    title = ""
+    if blocks and blocks[0]["type"] == "heading" and blocks[0]["level"] == 1:
+        title = blocks.pop(0)["text"]
+    return {"title": title, "blocks": blocks}
+
+
+def _excel_value(text):
+    """数値に見える文字列は数値に、それ以外はそのまま。"""
+    s = str(text).strip()
+    if _NUMBER_RE.match(s):
+        return float(s) if "." in s else int(s)
+    if _GROUPED_NUMBER_RE.match(s):
+        s = s.replace(",", "")
+        return float(s) if "." in s else int(s)
+    return str(text)
+
+
+def _column_letter(index):
+    """0 始まりの列番号 -> A, B, ..., Z, AA, ..."""
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _display_width(text):
+    """全角を 2、半角を 1 と数えた幅 (列幅の目安)。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WFA" else 1 for ch in str(text))
+
+
+def _sheet_name(title, index, used):
+    """シート名に使えない文字を除き、31 文字以内で重複しない名前にする。"""
+    name = re.sub(r"[\[\]:*?/\\]", "_", title or "").strip()[:31] or f"表{index}"
+    base, n = name, 2
+    while name in used:
+        suffix = f" ({n})"
+        name = base[:31 - len(suffix)] + suffix
+        n += 1
+    used.add(name)
+    return name
+
+
+def write_xlsx(path, tables):
+    """表を .xlsx に書く。1 表 1 シート。見出し行は太字・固定、列幅は内容に合わせる。
+
+    利用者の環境には openpyxl が無いため、標準ライブラリ (zipfile) だけで最小構成の
+    Office Open XML を組み立てる。
+    """
+    def esc(value):
+        return xml_escape(_XML_ILLEGAL_RE.sub("", str(value)))
+
+    sheets = []
+    used = set()
+    for n, table in enumerate(tables, 1):
+        name = _sheet_name(table.get("title"), n, used)
+        rows = [table["columns"]] + table["rows"]
+        cells_xml = []
+        for r, row in enumerate(rows, 1):
+            cells = []
+            for c, value in enumerate(row):
+                ref = f"{_column_letter(c)}{r}"
+                style = ' s="1"' if r == 1 else ""
+                v = str(value) if r == 1 else _excel_value(value)
+                if isinstance(v, (int, float)):
+                    cells.append(f'<c r="{ref}"{style}><v>{v}</v></c>')
+                elif v != "":
+                    cells.append(f'<c r="{ref}" t="inlineStr"{style}>'
+                                 f'<is><t xml:space="preserve">{esc(v)}</t></is></c>')
+            cells_xml.append(f'<row r="{r}">{"".join(cells)}</row>')
+        widths = [
+            min(60, max(8, max((_display_width(row[c]) for row in rows if c < len(row)), default=0) + 2))
+            for c in range(len(table["columns"]))
+        ]
+        cols_xml = "".join(
+            f'<col min="{c + 1}" max="{c + 1}" width="{w}" customWidth="1"/>'
+            for c, w in enumerate(widths)
+        )
+        sheets.append((name, (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetViews><sheetView workbookViewId="0">'
+            '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+            '</sheetView></sheetViews>'
+            f'<cols>{cols_xml}</cols>'
+            f'<sheetData>{"".join(cells_xml)}</sheetData>'
+            '</worksheet>'
+        )))
+
+    ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType='
+        '"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType='
+        '"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType='
+            '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, len(sheets) + 1)
+        )
+        + '</Types>'
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{ns_rel}/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+        f' xmlns:r="{ns_rel}"><sheets>'
+        + "".join(
+            f'<sheet name="{xml_escape(name, {chr(34): "&quot;"})}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, (name, _) in enumerate(sheets, 1)
+        )
+        + '</sheets></workbook>'
+    )
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}" Type="{ns_rel}/worksheet" Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, len(sheets) + 1)
+        )
+        + f'<Relationship Id="rId{len(sheets) + 1}" Type="{ns_rel}/styles" Target="styles.xml"/>'
+        '</Relationships>'
+    )
+    # スタイル 0 = 標準、1 = 見出し行 (太字 + 薄い灰色の背景)
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="2"><font><sz val="11"/><name val="Yu Gothic"/><family val="2"/></font>'
+        '<font><b/><sz val="11"/><name val="Yu Gothic"/><family val="2"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFE7E6E6"/><bgColor indexed="64"/>'
+        '</patternFill></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '</cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+    path = Path(path)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("xl/workbook.xml", workbook)
+        z.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        z.writestr("xl/styles.xml", styles)
+        for i, (_, sheet) in enumerate(sheets, 1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet)
+    return path
+
+
+def write_docx(path, document):
+    """文書を .docx に書く (python-docx を使う)。"""
+    try:
+        import docx
+        from docx.shared import Pt
+    except ImportError:
+        raise RuntimeError("Word 形式で保存するには python-docx が必要です (pip install python-docx)")
+    doc = docx.Document()
+    if document.get("title"):
+        doc.add_heading(document["title"], level=0)
+    for block in document["blocks"]:
+        kind = block["type"]
+        if kind == "heading":
+            doc.add_heading(block["text"], level=min(max(block.get("level", 1), 1), 4))
+        elif kind == "bullet":
+            doc.add_paragraph(block["text"], style="List Bullet")
+        elif kind == "number":
+            doc.add_paragraph(block["text"], style="List Number")
+        elif kind == "code":
+            run = doc.add_paragraph().add_run(block["text"])
+            run.font.name = "Consolas"
+            run.font.size = Pt(9)
+        elif kind == "table":
+            table = block["table"]
+            grid = doc.add_table(rows=1, cols=len(table["columns"]))
+            grid.style = "Table Grid"
+            for cell, text in zip(grid.rows[0].cells, table["columns"]):
+                cell.paragraphs[0].add_run(str(text)).bold = True
+            for row in table["rows"]:
+                for cell, text in zip(grid.add_row().cells, row):
+                    cell.text = str(text)
+        else:
+            doc.add_paragraph(block["text"])
+    path = Path(path)
+    doc.save(str(path))
+    return path
+
+
+def safe_filename(title, fallback="answer"):
+    """題名をファイル名に使える形にする。"""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", title or "").strip(" .")[:40]
+    return name or fallback
+
+
+# --------------------------------------------------------------------------
 # 会話履歴ストア (1 会話 = 1 JSON ファイル)
 # --------------------------------------------------------------------------
 class SessionStore:
@@ -898,14 +1357,21 @@ class LLMEngine:
         log.info("mmproj を使用: %s", mmproj.name)
         return handler
 
-    def stream(self, messages, max_tokens, temperature, top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K):
-        """応答トークンを順次 yield するジェネレータ。"""
+    def stream(self, messages, max_tokens, temperature, top_p=DEFAULT_TOP_P, top_k=DEFAULT_TOP_K,
+               response_format=None):
+        """応答トークンを順次 yield するジェネレータ。
+
+        response_format: {"type": "json_object", "schema": ...} を渡すと、llama-cpp-python が
+        スキーマを文法 (GBNF) に変換し、その形の JSON しか出力できないよう縛る。
+        チャットテンプレート経路と MTMDChatHandler (Gemma4ChatHandler の親) の両方が対応している。
+        """
         self.last_finish_reason = None
         if self.llm is None:
             if self.load_error:
                 raise RuntimeError(f"モデルが読み込まれていません: {self.load_error}")
-            yield from self._mock_stream(messages)
+            yield from self._mock_stream(messages, response_format)
             return
+        extra = {"response_format": response_format} if response_format else {}
         completion = self.llm.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
@@ -914,6 +1380,7 @@ class LLMEngine:
             top_k=top_k,
             stop=stop_words_for(self.model_name),
             stream=True,
+            **extra,
         )
         for chunk in completion:
             choice = chunk["choices"][0]
@@ -958,9 +1425,26 @@ class LLMEngine:
         return used, total
 
     @staticmethod
-    def _mock_stream(messages):
+    def _mock_stream(messages, response_format=None):
         """UI 確認用のダミー応答 (1文字ずつ返す)。"""
         user = plain_content(messages[-1]["content"]) if messages else ""
+        if response_format:
+            # Excel / Word 出力の確認用に、スキーマどおりの JSON を返す
+            schema = response_format.get("schema") or {}
+            if "columns" in schema.get("properties", {}):
+                data = {"title": "モック表", "columns": ["項目", "数量", "備考"],
+                        "rows": [["りんご", "3", "青森産"], ["みかん", "12", ""],
+                                 ["合計", "1,500", "円"]]}
+            else:
+                data = {"title": "モック文書", "blocks": [
+                    {"type": "heading", "text": "概要"},
+                    {"type": "paragraph", "text": f"「{user}」に対するダミーの文書です。"},
+                    {"type": "bullet", "text": "一つ目の要点"},
+                    {"type": "bullet", "text": "二つ目の要点"}]}
+            for ch in json.dumps(data, ensure_ascii=False):
+                time.sleep(0.005)
+                yield ch
+            return
         thinking = any(
             m["role"] == "system" and THINK_TOKEN in plain_content(m["content"])
             for m in messages
@@ -1086,7 +1570,7 @@ class SaveChoiceDialog:
     candidates: [(見出し, プレビュー文字列), ...]。選ばれた添字 (取り消しなら None) を返す。
     """
 
-    def __init__(self, parent, candidates):
+    def __init__(self, parent, candidates, default=0):
         self.result = None
         self.window = tk.Toplevel(parent)
         self.window.title("回答をファイルに保存")
@@ -1097,7 +1581,7 @@ class SaveChoiceDialog:
         body = ttk.Frame(self.window, padding=14)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="保存する内容を選んでください").pack(anchor="w", pady=(0, 8))
-        self.choice = tk.IntVar(value=1 if len(candidates) > 1 else 0)
+        self.choice = tk.IntVar(value=default)
         for i, (label, preview) in enumerate(candidates):
             ttk.Radiobutton(body, text=label, variable=self.choice, value=i).pack(anchor="w")
             if preview:
@@ -1159,6 +1643,7 @@ class ChatApp:
         self._in_thought = False       # 思考チャネルを表示中か
         self._answer_started = False   # 回答の最初のトークンを出したか
         self._thumbnails = []          # チャット欄に貼った画像 (GC されると消えるため保持)
+        self._structured = None        # 生成中の回答が Excel / Word 出力なら "table" / "document"
         self._placeholder_on = False   # 入力欄に案内文を表示中か
 
         # モデルフォルダは UI (モデル一覧) を組み立てる前に確定させる
@@ -1273,6 +1758,8 @@ class ChatApp:
         self.show_settings_var = tk.BooleanVar(value=False)
         self.font_size_var = tk.IntVar(value=DEFAULT_FONT_SIZE)
         self.save_dir_var = tk.StringVar(value="")      # 最後に回答を保存したフォルダ
+        # 回答の形式。Excel 表 / Word 文書を選ぶと、モデルの出力を JSON に縛って書き出す
+        self.output_mode_var = tk.StringVar(value="チャット")
         self.search_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="準備完了")
         self.model_state_var = tk.StringVar(value="● 未読み込み")
@@ -1301,6 +1788,12 @@ class ChatApp:
                               command=self.on_save_answer)
         chat_menu.add_separator()
         chat_menu.add_checkbutton(label="思考モード", variable=self.thinking_var)
+        chat_menu.add_separator()
+        for label in OUTPUT_MODES:
+            chat_menu.add_radiobutton(
+                label=f"出力: {label}", value=label, variable=self.output_mode_var,
+                command=self._on_output_mode,
+            )
         menubar.add_cascade(label="チャット", menu=chat_menu)
 
         view_menu = tk.Menu(menubar, tearoff=False)
@@ -1463,6 +1956,9 @@ class ChatApp:
         chat.tag_config("thought", foreground=COLORS["thought"], font=self.fonts["small_italic"],
                         lmargin1=22, lmargin2=22, spacing2=2)
         chat.tag_config("thought_head", font=self.fonts["small"], spacing1=4, spacing3=2)
+        # Excel / Word 出力の生成中に流れてくる JSON (完成したら表・文書の表示に置き換える)
+        chat.tag_config("json_raw", foreground=COLORS["muted"], font=self.fonts["small"],
+                        lmargin1=10, lmargin2=10)
         chat.tag_config("system", foreground=COLORS["muted"], font=self.fonts["small"],
                         justify="center", spacing1=6, spacing3=6)
         chat.tag_config("error", foreground=COLORS["error"], font=self.fonts["small"],
@@ -1500,11 +1996,17 @@ class ChatApp:
         self.camera_btn = ttk.Button(tools, text="カメラ...", width=-8, command=self.on_camera)
         self.camera_btn.pack(side="left", padx=(4, 0))
         ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
+        # 狭いときは右側から切れるので、よく変えるものほど左に置く
+        # (「思考を表示」は一度決めたら変えないことが多いので、表示メニューにだけ置く)
+        ttk.Label(tools, text="出力").pack(side="left")
+        self.output_combo = ttk.Combobox(
+            tools, textvariable=self.output_mode_var, values=list(OUTPUT_MODES),
+            state="readonly", width=9,
+        )
+        self.output_combo.pack(side="left", padx=(4, 0))
+        self.output_combo.bind("<<ComboboxSelected>>", lambda e: self._on_output_mode())
+        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
         ttk.Checkbutton(tools, text="思考モード", variable=self.thinking_var).pack(side="left")
-        ttk.Checkbutton(
-            tools, text="思考を表示", variable=self.show_thought_var,
-            command=self._apply_thought_visibility,
-        ).pack(side="left", padx=(8, 0))
 
         # 添付一覧 (添付があるときだけ表示する)
         self.attach_row = ttk.Frame(box)
@@ -1868,7 +2370,7 @@ class ChatApp:
     def on_save_answer(self):
         """直近の回答をファイルに保存する。
 
-        回答にコードブロックがあれば、全体かブロック単体かを選べる。
+        候補は「回答全体 (.md / Word)」「コードブロック単体」「表 (Excel)」。
         ブロック単体なら言語名から拡張子を決める (```csv なら .csv)。
         書き込みはアプリが行い、場所は必ず人が選ぶ (モデルに任意の場所へ書かせない)。
         """
@@ -1879,8 +2381,22 @@ class ChatApp:
             self.status_var.set("保存できる回答がありません")
             return
 
-        # 候補: [(見出し, プレビュー, 中身, 拡張子)]。先頭は回答全体 (Markdown)
-        candidates = [("回答全体 (.md)", "", answer.rstrip() + "\n", ".md")]
+        # 候補: [(見出し, プレビュー, 書き出す関数, 中身, 拡張子)]
+        candidates = [
+            ("回答全体 (.md)", "", save_text_file, answer.rstrip() + "\n", ".md"),
+            ("回答全体 → Word (.docx)", "", write_docx, markdown_to_document(answer), ".docx"),
+        ]
+        tables = extract_tables(answer)
+        document = candidates[1][3]
+        has_markdown_table = any(b["type"] == "table" for b in document["blocks"])
+        for i, table in enumerate(tables, 1):
+            preview = " | ".join(table["columns"])[:60]
+            label = f"表 {i} → Excel (.xlsx, {len(table['rows'])} 行 × {len(table['columns'])} 列)"
+            candidates.append((label, preview, write_xlsx, [table], ".xlsx"))
+        if len(tables) > 1:
+            candidates.append((f"すべての表 → Excel (.xlsx, {len(tables)} シート)", "",
+                               write_xlsx, tables, ".xlsx"))
+        first_block = len(candidates)
         for i, (lang, body) in enumerate(extract_code_blocks(answer), 1):
             lines = body.splitlines()
             preview = "\n".join(line[:60] for line in lines[:SAVE_PREVIEW_LINES])
@@ -1888,37 +2404,87 @@ class ChatApp:
                 preview += "\n…"
             suffix = suffix_for_language(lang)
             label = f"コードブロック {i}: {lang or 'テキスト'} ({len(lines)} 行, {suffix})"
-            candidates.append((label, preview, body, suffix))
+            candidates.append((label, preview, save_text_file, body, suffix))
 
-        index = 0
-        if len(candidates) > 1:
-            index = SaveChoiceDialog(self.root, [(c[0], c[1]) for c in candidates]).show()
-            if index is None:
-                return
-        _, _, text, suffix = candidates[index]
+        # 既定は「Markdown の表があれば Excel、コードブロックがあればそのブロック、
+        # 無ければ回答全体」。```csv で頼まれた場合は CSV のまま保存したいことが多い
+        if has_markdown_table:
+            default = 2
+        elif len(candidates) > first_block:
+            default = first_block
+        else:
+            default = 0
+        index = SaveChoiceDialog(
+            self.root, [(c[0], c[1]) for c in candidates], default=default
+        ).show()
+        if index is None:
+            return
+        _, _, writer, payload, suffix = candidates[index]
+        self._save_with_dialog(writer, payload, suffix, "answer")
 
+    def _save_with_dialog(self, writer, payload, suffix, stem):
+        """保存先を聞いて writer(path, payload) で書き出す。保存したパスを返す。"""
         initial_dir = self.save_dir_var.get()
         if not initial_dir or not Path(initial_dir).is_dir():
             initial_dir = str(Path.home())
         chosen = filedialog.asksaveasfilename(
             title="回答をファイルに保存",
             initialdir=initial_dir,
-            initialfile=time.strftime("answer_%Y%m%d_%H%M%S") + suffix,
+            initialfile=f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}{suffix}",
             defaultextension=suffix,
             filetypes=[(f"{suffix} ファイル", f"*{suffix}"), ("すべてのファイル", "*.*")],
         )
         if not chosen:
-            return
+            return None
         try:
-            path = save_text_file(chosen, text)
+            path = writer(chosen, payload)
         except Exception as e:
             log.exception("[保存] 失敗: %s", chosen)
             self._append_system(f"保存できませんでした: {e}", error=True)
-            return
+            return None
         self.save_dir_var.set(str(path.parent))
-        log.info("[保存] %s (%d 文字)", path, len(text))
+        log.info("[保存] %s", path)
         self._append_system(f"保存しました: {path}")
         self.status_var.set(f"保存しました: {path.name}")
+        return path
+
+    def _finish_structured(self, stopped):
+        """Excel / Word 出力の JSON を読み、画面の表示を表・文書に置き換える。
+
+        読めた場合は (種別, データ) を返し、_assistant_buf を Markdown に差し替える
+        (会話履歴には JSON ではなく読める形で残す。後から「回答を保存」でも使える)。
+        読めなければ JSON のまま残して理由を出し、None を返す。
+        """
+        kind = self._structured
+        self._structured = None
+        if stopped:
+            self._append_system("途中で止めたため、ファイルは作りませんでした")
+            return None
+        try:
+            data = parse_structured(kind, self._assistant_buf)
+        except ValueError as e:
+            log.warning("[GEN] 構造化出力を読めません: %s", e)
+            hint = ""
+            if self.engine.last_finish_reason == "length":
+                hint = " (max_tokens に達して途中で切れています。詳細設定で増やしてください)"
+            self._append_system(f"表・文書として読めませんでした: {e}{hint}", error=True)
+            return None
+        markdown = structured_to_markdown(kind, data)
+        self.chat.config(state="normal")
+        self.chat.delete("answer_start", "end-1c")
+        self.chat.insert("end", markdown, "assistant")
+        self.chat.config(state="disabled")
+        self.chat.see("end")
+        self._assistant_buf = markdown
+        return kind, data
+
+    def _save_structured(self, kind, data):
+        """Excel / Word 出力の結果を保存する (保存先は人が選ぶ)。"""
+        stem = safe_filename(data.get("title"))
+        if kind == "table":
+            self._save_with_dialog(write_xlsx, [data], ".xlsx", stem)
+        else:
+            self._save_with_dialog(write_docx, data, ".docx", stem)
 
     def on_new_chat(self):
         if self.generating:
@@ -2245,10 +2811,32 @@ class ChatApp:
         self.status_var.set("停止中 ...")
         log.info("[UI] 停止要求")
 
+    def _output_kind(self):
+        """今の出力形式 ("table" / "document"、通常のチャットなら None)。"""
+        return OUTPUT_MODES.get(self.output_mode_var.get())
+
+    def _on_output_mode(self):
+        kind = self._output_kind()
+        if kind:
+            self._append_system(
+                f"出力形式: {self.output_mode_var.get()}。次の回答は"
+                + ("表" if kind == "table" else "文書")
+                + "として作り、終わったら保存先を聞きます (思考モードは使いません)"
+            )
+        self.input.focus_set()
+
     def _system_message(self):
-        """システムプロンプト (思考モードなら先頭に <|think|>) を組み立てる。"""
+        """システムプロンプト (思考モードなら先頭に <|think|>) を組み立てる。
+
+        Excel / Word 出力のときは形式の説明を足し、思考モードは使わない
+        (出力を JSON の文法で縛るため、思考チャネルの記号を出せなくなる)。
+        """
         text = self.system_var.get().strip()
-        if self.thinking_var.get():
+        kind = self._output_kind()
+        if kind:
+            instruction = STRUCTURED_INSTRUCTIONS[kind]
+            text = f"{text}\n\n{instruction}" if text else instruction
+        elif self.thinking_var.get():
             text = f"{THINK_TOKEN}\n{text}" if text else THINK_TOKEN
         return {"role": "system", "content": text} if text else None
 
@@ -2265,7 +2853,8 @@ class ChatApp:
         if system:
             messages.insert(0, system)
         max_tokens = int(self.maxtok_var.get())
-        if self.thinking_var.get():
+        structured = self._output_kind()
+        if self.thinking_var.get() and not structured:
             # 思考は回答と同じ予算を消費するので、その分を上乗せする
             max_tokens += THINKING_EXTRA_TOKENS
 
@@ -2295,18 +2884,29 @@ class ChatApp:
             "top_p": float(self.top_p_var.get()),
             "top_k": int(self.top_k_var.get()),
         }
+        if structured:
+            params["response_format"] = {
+                "type": "json_object", "schema": STRUCTURED_SCHEMAS[structured],
+            }
 
         # 準備が済んでから UI を生成中の状態にする (通知が "AI:" の後に出ないように)
         self.generating = True
         self._stop_event.clear()
         self._in_thought = False        # 思考チャネルを表示中か
         self._answer_started = False    # 回答の最初のトークンを出したか
+        self._structured = structured   # この生成が Excel / Word 出力か
         # 送信ボタンは生成中だけ「停止」になる (Esc でも止められる)
         self.send_btn.config(text="■ 停止", command=self.on_stop, state="normal")
         self.regen_btn.config(state="disabled")
-        self.status_var.set("生成中 ...  (Esc で停止)")
+        self.status_var.set(
+            {"table": "表を生成中 ...", "document": "文書を生成中 ..."}.get(structured, "生成中 ...")
+            + "  (Esc で停止)"
+        )
         self._set_busy(True)
         self._append_message("assistant", "")  # "AI" の見出しだけ先に表示
+        # 生成された JSON を、完成後に表・文書の表示へ置き換えるための目印
+        self.chat.mark_set("answer_start", "end-1c")
+        self.chat.mark_gravity("answer_start", "left")
 
         threading.Thread(
             target=self._gen_worker, args=(messages, params), name="gen", daemon=True,
@@ -2317,6 +2917,8 @@ class ChatApp:
             "[GEN] 生成開始 (max_tokens=%(max_tokens)d, temperature=%(temperature).2f,"
             " top_p=%(top_p).2f, top_k=%(top_k)d)", params,
         )
+        if params.get("response_format"):
+            log.info("[GEN] 出力を JSON スキーマで制約 (%s)", self._structured)
         t0 = time.time()
         first = None
         n = 0
@@ -2393,7 +2995,7 @@ class ChatApp:
                             continue
                         self._answer_started = True
                     self._assistant_buf += payload
-                    self._stream_token(payload, "assistant")
+                    self._stream_token(payload, "json_raw" if self._structured else "assistant")
                 elif kind == "thought":
                     # 思考は表示するだけで履歴には残さない (次のターンへは渡さない)
                     if not self._in_thought:
@@ -2402,6 +3004,9 @@ class ChatApp:
                         payload = payload.lstrip("\n")
                     self._stream_token(payload, "thought")
                 elif kind in ("end", "stopped"):
+                    structured_result = None
+                    if self._structured and self._assistant_buf:
+                        structured_result = self._finish_structured(kind == "stopped")
                     if self._assistant_buf:
                         self.history.append(
                             {"role": "assistant", "content": self._assistant_buf}
@@ -2424,6 +3029,9 @@ class ChatApp:
                     )
                     self._save_current()        # 1往復ごとに自動保存
                     self._refresh_sidebar()
+                    if structured_result:
+                        # 画面の更新が済んでから保存先を聞く
+                        self.root.after(50, lambda r=structured_result: self._save_structured(*r))
                 elif kind == "error":
                     self._append_system(f"エラー: {payload}", error=True)
                     if "context window" in payload.lower():
@@ -2432,6 +3040,7 @@ class ChatApp:
                             "max_tokens を減らすか、LLM_N_CTX を大きくして起動し直してください"
                         )
                     self._assistant_buf = ""
+                    self._structured = None
                     self._finish_generation("エラー")
                 elif kind == "loaded":
                     self._set_busy(False)
