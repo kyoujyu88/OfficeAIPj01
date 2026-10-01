@@ -18,6 +18,7 @@
   - 回答をファイルに保存 (回答全体を .md / Word、表を Excel、コードブロック単体を言語に合った拡張子で)
   - 出力形式「Excel 表」「Word 文書」: モデルの出力を JSON スキーマで縛り、アプリが .xlsx / .docx に変換
   - スキル: 用途ごとの指示・出力形式・思考モード・ひな形を保存しておき、選ぶだけで切り替える
+  - 資料検索 (RAG): 資料フォルダから質問に関係する部分を探して回答に使い、出典を表示 (rag.py)
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
@@ -55,6 +56,7 @@ import base64
 import logging
 import mimetypes
 import zipfile
+import subprocess
 import threading
 import unicodedata
 from pathlib import Path
@@ -79,6 +81,10 @@ SESSIONS_DIR = Path(__file__).resolve().parent / "chat_sessions"
 # アプリ設定 (システムプロンプト・サンプリング値など) の保存先。
 # 会話ごとの設定は各会話の JSON 側に持つ。こちらは「新しいチャットの初期値」。
 SETTINGS_PATH = Path(__file__).resolve().parent / "chat_settings.json"
+
+# 資料検索 (RAG) を使うとき、検索した抜粋のために空けておくトークン数
+# (rag.MAX_CONTEXT_CHARS = 1500 字 + 出典や指示の文。日本語は 1 字 ≒ 1 トークン弱)
+RAG_RESERVED_TOKENS = 1200
 
 # スキル (用途ごとの指示のセット) の保存先。「スキルの設定」画面で編集する。
 SKILLS_PATH = Path(__file__).resolve().parent / "chat_skills.json"
@@ -470,8 +476,11 @@ DOC_READERS = {".pdf": _read_pdf, ".docx": _read_docx, ".xlsx": _read_xlsx, ".xl
 SUPPORTED_SUFFIXES = IMAGE_SUFFIXES | TEXT_SUFFIXES | set(DOC_READERS)
 
 
-def extract_document_text(path):
-    """文書ファイルからテキストを取り出す。読めない場合は RuntimeError。"""
+def extract_document_text(path, max_chars=MAX_DOC_CHARS):
+    """文書ファイルからテキストを取り出す。読めない場合は RuntimeError。
+
+    max_chars: これを超える部分は省略する (添付用)。None なら全文 (資料検索の索引用)。
+    """
     suffix = path.suffix.lower()
     if suffix in DOC_READERS:
         try:
@@ -489,10 +498,10 @@ def extract_document_text(path):
     text = text.strip()
     if not text:
         raise RuntimeError("テキストを抽出できませんでした (画像だけの PDF などの可能性)")
-    if len(text) > MAX_DOC_CHARS:
-        omitted = len(text) - MAX_DOC_CHARS
+    if max_chars is not None and len(text) > max_chars:
+        omitted = len(text) - max_chars
         log.warning("[添付] %s が長いため %d 文字を省略しました", path.name, omitted)
-        text = text[:MAX_DOC_CHARS] + f"\n…(以降 {omitted} 文字を省略)"
+        text = text[:max_chars] + f"\n…(以降 {omitted} 文字を省略)"
     return text
 
 
@@ -2116,6 +2125,238 @@ class SkillEditor:
         return self.result
 
 
+def open_path(path):
+    """ファイルを既定のアプリで開く (出典のクリック用)。"""
+    if os.name == "nt":
+        os.startfile(str(path))                     # noqa: (Windows のみ)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+class RagWindow:
+    """資料検索 (RAG) の設定画面: 資料フォルダと埋め込みモデルの指定、索引の作成、検索テスト。
+
+    索引の作成と検索テストは別スレッドで行い、画面は queue 経由で更新する
+    (埋め込みモデルの読み込みや、数百ファイルの索引作成には時間がかかるため)。
+    """
+
+    POLL_MS = 100
+
+    def __init__(self, app):
+        self.app = app
+        self.queue = queue.Queue()
+        self.cancel = threading.Event()
+        self.busy = False
+
+        self.window = tk.Toplevel(app.root)
+        self.window.title("資料検索 (RAG) の設定")
+        self.window.transient(app.root)
+        self.window.minsize(640, 520)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        rows = (
+            ("資料フォルダ", app.rag_docs_dir_var, "資料フォルダを選択"),
+            ("埋め込みモデル", app.rag_model_dir_var, "埋め込みモデルのフォルダを選択"),
+        )
+        for r, (label, var, title) in enumerate(rows):
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(body, textvariable=var).grid(row=r, column=1, sticky="ew", pady=2, padx=(8, 4))
+            ttk.Button(body, text="参照...", width=-6,
+                       command=lambda v=var, t=title: self._choose_dir(v, t)).grid(row=r, column=2)
+        ttk.Label(
+            body, style="Muted.TLabel", justify="left", wraplength=560,
+            text=("資料フォルダの中の PDF / Word / Excel / テキストを検索できるようにします (サブフォルダも含む)。"
+                  "埋め込みモデルは sentence-transformers 形式のフォルダを、あらかじめダウンロードして"
+                  "置いてください (例: multilingual-e5-small、ruri-v3-30m)。"),
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+        index_box = ttk.LabelFrame(body, text="索引", padding=8)
+        index_box.grid(row=3, column=0, columnspan=3, sticky="ew")
+        index_box.columnconfigure(0, weight=1)
+        self.summary_var = tk.StringVar()
+        ttk.Label(index_box, textvariable=self.summary_var).grid(row=0, column=0, columnspan=3, sticky="w")
+        self.build_btn = ttk.Button(index_box, text="索引を作成・更新", style="Accent.TButton",
+                                    command=self.build)
+        self.build_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.cancel_btn = ttk.Button(index_box, text="中止", width=-5, command=self.cancel.set,
+                                     state="disabled")
+        self.cancel_btn.grid(row=1, column=1, sticky="w", pady=(6, 0), padx=(6, 0))
+        self.progress_var = tk.StringVar(value="変更のあったファイルだけを読み直します")
+        ttk.Label(index_box, textvariable=self.progress_var, style="Muted.TLabel").grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(4, 0)
+        )
+
+        test_box = ttk.LabelFrame(body, text="検索テスト (どの資料が見つかるかを確かめる)", padding=8)
+        test_box.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+        body.rowconfigure(4, weight=1)
+        test_box.columnconfigure(0, weight=1)
+        test_box.rowconfigure(1, weight=1)
+        self.query_var = tk.StringVar()
+        query = ttk.Entry(test_box, textvariable=self.query_var)
+        query.grid(row=0, column=0, sticky="ew")
+        query.bind("<Return>", lambda e: self.search_test())
+        self.search_btn = ttk.Button(test_box, text="検索", width=-5, command=self.search_test)
+        self.search_btn.grid(row=0, column=1, padx=(6, 0))
+        self.results = scrolledtext.ScrolledText(test_box, height=10, wrap="word", state="disabled")
+        self.results.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
+        self.results.tag_config("head", foreground=COLORS["assistant_head"])
+
+        bottom = ttk.Frame(self.window, padding=(12, 0, 12, 12))
+        bottom.pack(fill="x")
+        ttk.Button(bottom, text="閉じる", command=self.close).pack(side="right")
+
+        self._refresh_summary()
+        center_on(self.window, app.root)
+        self.window.after(self.POLL_MS, self._poll)
+
+    # ---- 小物 ------------------------------------------------------------
+    def _choose_dir(self, var, title):
+        chosen = filedialog.askdirectory(title=title, initialdir=var.get() or str(Path.home()),
+                                         parent=self.window)
+        if chosen:
+            var.set(chosen)
+
+    def _refresh_summary(self):
+        index = self.app.rag_index
+        self.summary_var.set(index.summary() if index is not None else
+                             "資料検索のライブラリを読み込めません (numpy が必要です)")
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        self.build_btn.config(state=state)
+        self.search_btn.config(state=state)
+        self.cancel_btn.config(state="normal" if busy else "disabled")
+
+    def _show_results(self, text_parts):
+        self.results.config(state="normal")
+        self.results.delete("1.0", "end")
+        for text, tag in text_parts:
+            self.results.insert("end", text, tag)
+        self.results.config(state="disabled")
+
+    def _check_inputs(self, need_docs):
+        docs = self.app.rag_docs_dir_var.get().strip()
+        model = self.app.rag_model_dir_var.get().strip()
+        if self.app.rag_index is None:
+            return "資料検索のライブラリを読み込めません (numpy が必要です)"
+        if need_docs and not (docs and Path(docs).is_dir()):
+            return "資料フォルダを選んでください"
+        if not model:
+            return "埋め込みモデルのフォルダを選んでください"
+        return None
+
+    # ---- 索引の作成 ------------------------------------------------------
+    def build(self):
+        problem = self._check_inputs(need_docs=True)
+        if problem:
+            self.progress_var.set(problem)
+            return
+        self.cancel.clear()
+        self._set_busy(True)
+        self.progress_var.set("埋め込みモデルを読み込んでいます ...")
+        threading.Thread(target=self._build_worker, name="rag-build", daemon=True,
+                         args=(self.app.rag_docs_dir_var.get().strip(),
+                               self.app.rag_model_dir_var.get().strip())).start()
+
+    def _build_worker(self, docs_dir, model_dir):
+        try:
+            embedder = self.app._rag_embedder(model_dir)
+            with self.app._rag_lock:
+                t0 = time.time()
+                stats = self.app.rag_index.build(
+                    docs_dir, embedder, lambda p: extract_document_text(p, max_chars=None),
+                    progress=lambda n, total, name: self.queue.put(("progress", f"[{n}/{total}] {name}")),
+                    cancel=self.cancel,
+                )
+                stats["seconds"] = time.time() - t0
+            self.queue.put(("built", stats))
+        except Exception as e:
+            log.exception("[RAG] 索引の作成に失敗")
+            self.queue.put(("failed", str(e)))
+
+    # ---- 検索テスト ------------------------------------------------------
+    def search_test(self):
+        query = self.query_var.get().strip()
+        problem = self._check_inputs(need_docs=False)
+        if not query or problem:
+            self.progress_var.set(problem or "検索する文を入力してください")
+            return
+        if not self.app.rag_index.ready:
+            self.progress_var.set("先に索引を作成してください")
+            return
+        self._set_busy(True)
+        self.progress_var.set("検索中 ...")
+        threading.Thread(target=self._search_worker, name="rag-test", daemon=True,
+                         args=(query, self.app.rag_model_dir_var.get().strip())).start()
+
+    def _search_worker(self, query, model_dir):
+        try:
+            embedder = self.app._rag_embedder(model_dir)
+            with self.app._rag_lock:
+                hits = self.app.rag_index.search(query, embedder, top_k=5, max_chars=10 ** 9)
+            self.queue.put(("searched", hits))
+        except Exception as e:
+            log.exception("[RAG] 検索テストに失敗")
+            self.queue.put(("failed", str(e)))
+
+    # ---- 画面の更新 ------------------------------------------------------
+    def _poll(self):
+        if not self.window.winfo_exists():
+            return
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                if kind == "progress":
+                    self.progress_var.set(payload)
+                elif kind == "built":
+                    self._set_busy(False)
+                    s = payload
+                    text = (("中止しました (それまでの索引はそのまま残ります)" if s["cancelled"] else
+                             f"完了 ({s['seconds']:.0f} 秒): 追加 {s['added']} / 更新 {s['updated']} / "
+                             f"削除 {s['removed']} / 変更なし {s['unchanged']}"))
+                    if s["failed"]:
+                        text += f" / 読めないファイル {len(s['failed'])}"
+                        self._show_results(
+                            [("読めなかったファイル:\n", "head")]
+                            + [(f"・{name} ({reason})\n", None) for name, reason in s["failed"]]
+                        )
+                    self.progress_var.set(text)
+                    self._refresh_summary()
+                    self.app._refresh_rag_status()
+                elif kind == "searched":
+                    self._set_busy(False)
+                    self.progress_var.set(f"{len(payload)} 件")
+                    parts = []
+                    for hit in payload:
+                        parts.append((f"[{hit['no']}] {hit['score']:.3f}  {rag_source_label(hit)}\n", "head"))
+                        parts.append((hit["text"] + "\n\n", None))
+                    self._show_results(parts or [("見つかりませんでした", None)])
+                elif kind == "failed":
+                    self._set_busy(False)
+                    self.progress_var.set(f"エラー: {payload}")
+        except queue.Empty:
+            pass
+        self.window.after(self.POLL_MS, self._poll)
+
+    def close(self):
+        if self.busy:
+            self.cancel.set()           # 索引の作成は次のファイルの区切りで止まる
+        self.app._refresh_rag_status()
+        self.window.destroy()
+
+
+def rag_source_label(hit):
+    """出典の表示 ("規程/就業規則.pdf p.3")。rag.source_label と同じ (rag を読まずに使えるように)。"""
+    return f"{hit['file']} {hit['location']}".strip()
+
+
 class ChatApp:
     def __init__(self, root):
         self.root = root
@@ -2147,9 +2388,18 @@ class ChatApp:
             set_models_dir(saved_dir)
 
         self.skills = load_skills()    # スキル (用途ごとの指示のセット)
+        # 資料検索 (RAG)。索引は起動時に読み、埋め込みモデルは初めて使うときに読む
+        self.rag_index = None
+        self._rag_lock = threading.Lock()       # 索引の作成と検索を同時に行わない
+        self._embedder = None
+        self._embedder_key = None
+        self._embed_lock = threading.Lock()
+        self._pending_sources = None            # 生成中の回答に付ける出典
+        self._link_count = 0                    # 出典リンクのタグ名に使う連番
 
         self._build_ui()
         self._load_settings()
+        self._load_rag_index()
         self._refresh_sidebar()
         self._show_welcome()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2260,6 +2510,11 @@ class ChatApp:
         # 使うスキルの名前 (NO_SKILL なら使わない) と、その説明
         self.skill_var = tk.StringVar(value=NO_SKILL)
         self.skill_desc_var = tk.StringVar(value="")
+        # 資料検索 (RAG)
+        self.rag_enabled_var = tk.BooleanVar(value=False)
+        self.rag_docs_dir_var = tk.StringVar(value="")
+        self.rag_model_dir_var = tk.StringVar(value="")
+        self.rag_status_var = tk.StringVar(value="")
         self.search_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="準備完了")
         self.model_state_var = tk.StringVar(value="● 未読み込み")
@@ -2288,6 +2543,9 @@ class ChatApp:
                               command=self.on_save_answer)
         chat_menu.add_separator()
         chat_menu.add_command(label="スキルの設定...", command=self.on_edit_skills)
+        chat_menu.add_checkbutton(label="資料を検索して答える", variable=self.rag_enabled_var,
+                                  command=self._on_rag_toggle)
+        chat_menu.add_command(label="資料検索の設定...", command=self.on_rag_settings)
         chat_menu.add_separator()
         chat_menu.add_checkbutton(label="思考モード", variable=self.thinking_var)
         chat_menu.add_separator()
@@ -2352,6 +2610,20 @@ class ChatApp:
         )
         self.skill_desc_label.pack(anchor="w", pady=(2, 0))
         self._refresh_skill_choices()
+
+        # 資料検索 (RAG): オンにすると、送信のたびに資料から関係する部分を探して回答に使う
+        ttk.Label(parent, text="資料検索", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
+        rag_row = ttk.Frame(parent)
+        rag_row.pack(fill="x")
+        ttk.Button(rag_row, text="設定...", width=-5, command=self.on_rag_settings).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Checkbutton(
+            rag_row, text="資料を検索して答える", variable=self.rag_enabled_var,
+            command=self._on_rag_toggle,
+        ).pack(side="left")
+        ttk.Label(parent, textvariable=self.rag_status_var, style="Muted.TLabel",
+                  wraplength=220, justify="left").pack(anchor="w", pady=(2, 0))
 
         ttk.Label(parent, text="会話履歴", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
         # 表示用の変数と、絞り込みに使う本当の値 (search_var) を分けておく
@@ -2483,6 +2755,12 @@ class ChatApp:
         # Excel / Word 出力の生成中に流れてくる JSON (完成したら表・文書の表示に置き換える)
         chat.tag_config("json_raw", foreground=COLORS["muted"], font=self.fonts["small"],
                         lmargin1=10, lmargin2=10)
+        # 資料検索の出典 (クリックで資料を開く)
+        chat.tag_config("source", foreground=COLORS["muted"], font=self.fonts["small"],
+                        lmargin1=10, lmargin2=10, spacing1=4)
+        chat.tag_config("srclink", foreground=COLORS["accent"], underline=True)
+        chat.tag_bind("srclink", "<Enter>", lambda e: chat.config(cursor="hand2"))
+        chat.tag_bind("srclink", "<Leave>", lambda e: chat.config(cursor=""))
         chat.tag_config("system", foreground=COLORS["muted"], font=self.fonts["small"],
                         justify="center", spacing1=6, spacing3=6)
         chat.tag_config("error", foreground=COLORS["error"], font=self.fonts["small"],
@@ -2773,6 +3051,9 @@ class ChatApp:
             "font_size": (self.font_size_var, int),
             "save_dir": (self.save_dir_var, str),
             "skill": (self.skill_var, str),
+            "rag_enabled": (self.rag_enabled_var, bool),
+            "rag_docs_dir": (self.rag_docs_dir_var, str),
+            "rag_model_dir": (self.rag_model_dir_var, str),
         }
 
     def _load_settings(self):
@@ -3438,6 +3719,142 @@ class ChatApp:
         self._apply_skill(announce=False, template=False)
         self.status_var.set(f"スキルを保存しました ({len(result)} 件)")
 
+    # ---- 資料検索 (RAG) --------------------------------------------------
+    def _load_rag_index(self):
+        """保存済みの索引を読む (rag.py と numpy が無ければ資料検索を使えないだけ)。"""
+        try:
+            import rag
+
+            index = rag.RagIndex()
+            index.load()
+        except Exception as e:
+            log.warning("[RAG] 資料検索を使えません (%s)", e)
+            index = None
+        self.rag_index = index
+        self._refresh_rag_status()
+
+    def _refresh_rag_status(self):
+        index = self.rag_index
+        if index is None:
+            self.rag_status_var.set("使えません (numpy が必要です)")
+        elif not index.ready:
+            self.rag_status_var.set("索引がありません (「設定...」から作成)")
+        else:
+            self.rag_status_var.set(
+                f"{len(index.meta.get('files', {}))} ファイル / {len(index.chunks)} チャンク"
+            )
+
+    def _on_rag_toggle(self):
+        if not self.rag_enabled_var.get():
+            self._append_system("資料検索を使いません")
+            return
+        if self.rag_index is None or not self.rag_index.ready:
+            self._append_system("資料検索の索引がありません。「設定...」から作成してください")
+        elif not self.rag_model_dir_var.get().strip():
+            self._append_system("埋め込みモデルが未設定です。「設定...」から選んでください")
+        else:
+            self._append_system("資料検索を使います (回答の後に出典を表示します)")
+
+    def on_rag_settings(self):
+        if self.generating:
+            return
+        RagWindow(self)
+
+    def _rag_embedder(self, model_dir):
+        """埋め込みモデル (一度読んだら使い回す。フォルダが変わったら読み直す)。"""
+        import rag
+
+        with self._embed_lock:
+            if self._embedder is None or self._embedder_key != model_dir:
+                self._embedder = rag.Embedder(model_dir)
+                self._embedder_key = model_dir
+            return self._embedder
+
+    def _rag_query(self):
+        """資料検索を使う場合の (検索文, 埋め込みモデルのフォルダ)。使わないなら None。
+
+        Tk の変数はワーカースレッドから読めないので、ここ (UI スレッド) で値を取り出しておく。
+        """
+        if not self.rag_enabled_var.get():
+            return None
+        if self.rag_index is None or not self.rag_index.ready:
+            self._append_system("資料検索の索引が無いため、資料を使わずに答えます")
+            return None
+        if not self.rag_model_dir_var.get().strip():
+            self._append_system("埋め込みモデルが未設定のため、資料を使わずに答えます")
+            return None
+        last = self.history[-1] if self.history else None
+        if not last or last["role"] != "user":
+            return None
+        query = plain_content(last["content"]).strip()
+        return (query, self.rag_model_dir_var.get().strip()) if query else None
+
+    def _rag_augment(self, messages, query, model_dir):
+        """(ワーカースレッド) 資料を検索し、直近の発話に抜粋と出典を差し込む。
+
+        差し込むのは今回モデルへ送る messages だけで、画面と会話履歴の発話はそのまま
+        (毎ターン抜粋が履歴に積み上がって、コンテキストを圧迫しないように)。
+        """
+        import rag
+
+        self.token_queue.put(("status", "資料を検索中 ..."))
+        t0 = time.time()
+        # 索引を作成中なら待たずに、資料なしで答える
+        if not self._rag_lock.acquire(blocking=False):
+            self.token_queue.put(("rag_error", "索引を作成中のため、今回は資料を使いません"))
+            return messages
+        try:
+            embedder = self._rag_embedder(model_dir)
+            hits = self.rag_index.search(query, embedder)
+        except Exception as e:
+            log.exception("[RAG] 検索に失敗")
+            self.token_queue.put(("rag_error", str(e)))
+            return messages
+        finally:
+            self._rag_lock.release()
+        log.info("[RAG] 検索 %.2f 秒: %s", time.time() - t0,
+                 [(rag_source_label(h), round(h["score"], 3)) for h in hits])
+        if not hits:
+            return messages
+        self.token_queue.put(("sources", hits))
+        self.token_queue.put(("status", "生成中 ...  (Esc で停止)"))
+        text = rag.format_context(hits, query)
+        last = dict(messages[-1])
+        content = last["content"]
+        if isinstance(content, list):
+            # 画像付きの発話: 文のパートを置き換える (無ければ先頭に足す)
+            parts = [p for p in content if p.get("type") != "text"]
+            last["content"] = [{"type": "text", "text": text}] + parts
+        else:
+            last["content"] = text
+        return messages[:-1] + [last]
+
+    def _append_sources(self, sources):
+        """回答の下に出典を出す。クリックするとそのファイルを開く。"""
+        self.chat.config(state="normal")
+        self._ensure_newline()
+        self.chat.insert("end", "出典: ", "source")
+        for i, source in enumerate(sources, 1):
+            self._link_count += 1
+            tag = f"srclink{self._link_count}"
+            self.chat.insert("end", f"[{i}] {source['label']}", ("source", "srclink", tag))
+            self.chat.tag_bind(tag, "<Button-1>",
+                               lambda e, p=source["path"]: self._open_source(p))
+            if i < len(sources):
+                self.chat.insert("end", "  ", "source")
+        self.chat.insert("end", "\n", "source")
+        self.chat.config(state="disabled")
+        self.chat.see("end")
+
+    def _open_source(self, path):
+        if not Path(path).exists():
+            self._append_system(f"ファイルが見つかりません: {path}", error=True)
+            return
+        try:
+            open_path(path)
+        except Exception as e:
+            self._append_system(f"ファイルを開けません: {e}", error=True)
+
     def _output_kind(self):
         """今の出力形式 ("table" / "document"、通常のチャットなら None)。"""
         return OUTPUT_MODES.get(self.output_mode_var.get())
@@ -3478,10 +3895,12 @@ class ChatApp:
                 f"コンテキストの残りが少なくなっています ({usage[0]}/{usage[1]})。"
                 "「＋ 新規チャット」で始め直すか、LLM_N_CTX を大きくしてください"
             )
-        messages = list(self.history)
+        # 出典などアプリ用のキーはモデルへ渡さない (チャットテンプレートが想定していない)
+        messages = [{"role": m["role"], "content": m["content"]} for m in self.history]
         system = self._system_message()
         if system:
             messages.insert(0, system)
+        rag_query = self._rag_query()
         max_tokens = int(self.maxtok_var.get())
         structured = self._output_kind()
         if self.thinking_var.get() and not structured:
@@ -3490,6 +3909,8 @@ class ChatApp:
 
         # 履歴が伸びてもシステムプロンプトが押し出されないよう、予算内に収める
         budget = self.engine.context_budget(max_tokens)
+        if rag_query:
+            budget -= RAG_RESERVED_TOKENS       # 検索した抜粋を差し込むぶんを空けておく
         messages, dropped, stripped = fit_to_budget(
             messages, budget, self.engine.count_tokens
         )
@@ -3525,6 +3946,7 @@ class ChatApp:
         self._in_thought = False        # 思考チャネルを表示中か
         self._answer_started = False    # 回答の最初のトークンを出したか
         self._structured = structured   # この生成が Excel / Word 出力か
+        self._pending_sources = None
         # 送信ボタンは生成中だけ「停止」になる (Esc でも止められる)
         self.send_btn.config(text="■ 停止", command=self.on_stop, state="normal")
         self.regen_btn.config(state="disabled")
@@ -3539,10 +3961,10 @@ class ChatApp:
         self.chat.mark_gravity("answer_start", "left")
 
         threading.Thread(
-            target=self._gen_worker, args=(messages, params), name="gen", daemon=True,
+            target=self._gen_worker, args=(messages, params, rag_query), name="gen", daemon=True,
         ).start()
 
-    def _gen_worker(self, messages, params):
+    def _gen_worker(self, messages, params, rag_query=None):
         log.info(
             "[GEN] 生成開始 (max_tokens=%(max_tokens)d, temperature=%(temperature).2f,"
             " top_p=%(top_p).2f, top_k=%(top_k)d)", params,
@@ -3550,6 +3972,8 @@ class ChatApp:
         if params.get("response_format"):
             log.info("[GEN] 出力を JSON スキーマで制約 (%s)", self._structured)
         t0 = time.time()
+        if rag_query:
+            messages = self._rag_augment(messages, *rag_query)
         first = None
         n = 0
         splitter = ThoughtSplitter()
@@ -3635,14 +4059,26 @@ class ChatApp:
                         self._stream_token("思考\n", ("thought", "thought_head"))
                         payload = payload.lstrip("\n")
                     self._stream_token(payload, "thought")
+                elif kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "sources":
+                    self._pending_sources = payload
+                elif kind == "rag_error":
+                    self._append_system(f"資料検索を使えませんでした: {payload}", error=True)
                 elif kind in ("end", "stopped"):
                     structured_result = None
                     if self._structured and self._assistant_buf:
                         structured_result = self._finish_structured(kind == "stopped")
+                    sources = self._pending_sources
+                    self._pending_sources = None
                     if self._assistant_buf:
-                        self.history.append(
-                            {"role": "assistant", "content": self._assistant_buf}
-                        )
+                        message = {"role": "assistant", "content": self._assistant_buf}
+                        if sources:
+                            # 出典は会話と一緒に保存し、開き直したときも表示する
+                            message["sources"] = [
+                                {"label": rag_source_label(h), "path": h["path"]} for h in sources
+                            ]
+                        self.history.append(message)
                         self._dirty = True
                     self._assistant_buf = ""
                     truncated = payload.get("finish") == "length"
@@ -3661,6 +4097,8 @@ class ChatApp:
                         f"{label} ({payload['tokens']} tokens, {payload['speed']:.1f} tok/s"
                         + (f", 応答開始まで {wait:.1f} 秒" if wait is not None else "") + ")"
                     )
+                    if sources and self.history and self.history[-1].get("sources"):
+                        self._append_sources(self.history[-1]["sources"])
                     self._save_current()        # 1往復ごとに自動保存
                     self._refresh_sidebar()
                     if structured_result:
@@ -3675,6 +4113,7 @@ class ChatApp:
                         )
                     self._assistant_buf = ""
                     self._structured = None
+                    self._pending_sources = None
                     self._finish_generation("エラー")
                 elif kind == "loaded":
                     self._set_busy(False)
@@ -3707,6 +4146,8 @@ class ChatApp:
             self._append_message(
                 m["role"], plain_content(m["content"]), content_images(m["content"])
             )
+            if m.get("sources"):
+                self._append_sources(m["sources"])
 
     def _ensure_newline(self):
         """直前の出力が行の途中で終わっていれば改行する (見出しを行頭から始めるため)。"""

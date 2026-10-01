@@ -17,3 +17,6 @@ venv/
 
 # スキル (利用者ごとの設定)
 chat_skills.json
+
+# 資料検索 (RAG) の索引
+rag_index/
