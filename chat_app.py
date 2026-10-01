@@ -11,8 +11,10 @@
   - モデル選択 / temperature / top_p / top_k / max_tokens を UI から調整
   - システムプロンプトと思考 (reasoning) モード
   - 左サイドバーに会話履歴を一覧表示
-      * クリックで過去の会話を再開
-      * チェックを入れて選択した会話をまとめて削除
+      * クリックで過去の会話を再開 / タイトルで絞り込み
+      * Ctrl・Shift + クリックで複数選択してまとめて削除
+  - サンプリング等は折りたたみ式の詳細設定パネルに収納 (開閉状態は保存)
+  - キーボードショートカット (Esc で停止、Ctrl+N 新規、Ctrl +/- で文字サイズ 等)
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
@@ -51,6 +53,7 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
+from tkinter import font as tkfont
 
 # --------------------------------------------------------------------------
 # 設定
@@ -162,6 +165,33 @@ ATTACH_LABEL_MAXLEN = 60
 # チャット欄に貼る画像サムネイルの幅 (px)
 THUMBNAIL_WIDTH = 200
 
+# ---- 見た目 --------------------------------------------------------------
+# 日本語が読みやすいフォントを上から順に探す (どれも無ければ Tk の既定フォント)
+UI_FONT_CANDIDATES = (
+    "Yu Gothic UI", "Meiryo UI", "Meiryo", "BIZ UDPGothic",
+    "Noto Sans CJK JP", "Noto Sans JP", "IPAexGothic", "Hiragino Sans",
+)
+# チャット欄・入力欄の文字サイズ (pt)。Ctrl + / Ctrl - / Ctrl+ホイールで変更でき、設定に保存される
+DEFAULT_FONT_SIZE = 11
+FONT_SIZE_MIN = 8
+FONT_SIZE_MAX = 24
+
+# 配色 (チャット欄と状態表示)
+COLORS = {
+    "bg": "#ffffff",
+    "border": "#d0d7de",
+    "accent": "#0969da",
+    "muted": "#6e7781",
+    "user_head": "#1a7f37",
+    "user_bg": "#f0f6ff",
+    "assistant_head": "#0a3069",
+    "text": "#1f2328",
+    "thought": "#8250df",
+    "error": "#cf222e",
+    "ok": "#1a7f37",
+    "warn": "#9a6700",
+}
+
 # ---- カメラ --------------------------------------------------------------
 # 使うカメラの番号 (内蔵カメラは 0。外付けを使う場合は 1 以降)
 CAMERA_INDEX = int(os.environ.get("LLM_CAMERA_INDEX", 0))
@@ -260,6 +290,25 @@ except Exception as exc:  # ImportError 等
     Llama = None
     HAS_LLAMA = False
     log.warning("llama-cpp-python を読み込めません (%s) -> モックモードで起動します", exc)
+
+
+def pick_ui_font(families):
+    """使えるフォントの中から、日本語向けの UI フォントを選ぶ。無ければ None。"""
+    available = set(families)
+    return next((f for f in UI_FONT_CANDIDATES if f in available), None)
+
+
+def format_updated(ts, now=None):
+    """会話一覧に出す更新日時。今日なら時刻、今年なら月日、それ以前は年月日。"""
+    if not ts:
+        return ""
+    t = time.localtime(ts)
+    n = time.localtime(now if now is not None else time.time())
+    if t[:3] == n[:3]:
+        return time.strftime("%H:%M", t)
+    if t.tm_year == n.tm_year:
+        return time.strftime("%m/%d", t)
+    return time.strftime("%Y/%m/%d", t)
 
 
 def load_settings_file():
@@ -984,7 +1033,7 @@ class ChatApp:
         self.camera_window = None      # 開いているカメラ小窓 (無ければ None)
         self.current_id = None         # 現在の会話 ID (未保存なら None)
         self.current_created = None    # 現在の会話の作成時刻
-        self.session_rows = []         # サイドバー行 [(BooleanVar, meta), ...]
+        self._dirty = False            # 前回保存から会話が変わったか (開くだけでは並び順を変えない)
 
         self.token_queue = queue.Queue()
         self.generating = False
@@ -993,6 +1042,7 @@ class ChatApp:
         self._in_thought = False       # 思考チャネルを表示中か
         self._answer_started = False   # 回答の最初のトークンを出したか
         self._thumbnails = []          # チャット欄に貼った画像 (GC されると消えるため保持)
+        self._placeholder_on = False   # 入力欄に案内文を表示中か
 
         # モデルフォルダは UI (モデル一覧) を組み立てる前に確定させる
         saved_dir = load_settings_file().get("models_dir")
@@ -1004,6 +1054,7 @@ class ChatApp:
         self._build_ui()
         self._load_settings()
         self._refresh_sidebar()
+        self._show_welcome()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(POLL_INTERVAL_MS, self._poll_queue)
         log.info(
@@ -1012,162 +1063,513 @@ class ChatApp:
         )
 
     # ---- UI 構築 ---------------------------------------------------------
+    # 画面構成:
+    #   メニューバー
+    #   ┌ サイドバー ─┬ ヘッダー (モデル選択・状態・詳細設定の開閉) ─────┐
+    #   │ 新規チャット │ 詳細設定パネル (折りたたみ)                      │
+    #   │ 検索         │ チャット欄                                       │
+    #   │ 会話一覧     │ 入力欄 (ツール行 / 添付一覧 / テキスト + 送信)    │
+    #   └──────────────┴──────────────────────────────────────────────────┘
+    #   ステータスバー (状態・進行表示・コンテキスト使用量)
     def _build_ui(self):
         self.root.title("ローカルLLM チャット (CPU / オフライン)")
-        self.root.geometry("1000x640")
-        self.root.minsize(720, 460)
+        self.root.geometry("1100x720")
+        self.root.minsize(840, 540)
 
-        main = ttk.Frame(self.root)
-        main.pack(fill="both", expand=True)
+        self._setup_style()
+        self._build_vars()
+        self._build_menu()
+        # ステータスバーは先に下端へ置く (後から pack すると縮小時に押し出される)
+        self._build_statusbar()
 
-        # ===== 左サイドバー: 会話履歴 =====
-        left = ttk.Frame(main, width=240)
-        left.pack(side="left", fill="y")
-        left.pack_propagate(False)
+        paned = ttk.PanedWindow(self.root, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+        left = ttk.Frame(paned, padding=(8, 8, 4, 8))
+        right = ttk.Frame(paned, padding=(4, 8, 8, 4))
+        paned.add(left, weight=0)
+        paned.add(right, weight=1)
 
-        ttk.Button(left, text="＋ 新規チャット", command=self.on_new_chat).pack(
-            fill="x", padx=6, pady=(8, 4)
-        )
-        ttk.Label(left, text="会話履歴", foreground="#666666").pack(anchor="w", padx=8)
+        self._build_sidebar(left)
+        self._build_header(right)
+        self._build_settings_panel(right)
+        # 入力欄はチャット欄より先に下端へ置く (狭いときに入力欄が押し出されないように)
+        self._build_composer(right)
+        self._build_chat_view(right)
+        self._bind_shortcuts()
 
-        # スクロール可能なリスト領域 (Canvas + 内部 Frame)
-        list_wrap = ttk.Frame(left)
-        list_wrap.pack(fill="both", expand=True, padx=4, pady=4)
-        self.list_canvas = tk.Canvas(list_wrap, highlightthickness=0, width=224)
-        vsb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.list_canvas.yview)
-        self.list_frame = ttk.Frame(self.list_canvas)
-        self.list_frame.bind(
-            "<Configure>",
-            lambda e: self.list_canvas.configure(scrollregion=self.list_canvas.bbox("all")),
-        )
-        self.list_canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
-        self.list_canvas.configure(yscrollcommand=vsb.set)
-        self.list_canvas.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+    def _setup_style(self):
+        """フォントとテーマを整える。"""
+        self.style = ttk.Style(self.root)
+        # Linux の既定テーマ ("default") は古びて見えるので clam にする。Windows / macOS はネイティブのまま
+        if self.style.theme_use() == "default" and "clam" in self.style.theme_names():
+            self.style.theme_use("clam")
 
-        ttk.Button(left, text="選択した履歴を削除", command=self.on_delete_selected).pack(
-            fill="x", padx=6, pady=(4, 8)
-        )
+        family = None
+        try:
+            family = pick_ui_font(tkfont.families(self.root))
+        except Exception:
+            log.debug("[表示] フォント一覧を取得できませんでした", exc_info=True)
+        if family:
+            # ttk ウィジェット・メニュー等が使う既定フォントをまとめて差し替える
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+                try:
+                    tkfont.nametofont(name).configure(family=family)
+                except Exception:
+                    pass
+        else:
+            family = tkfont.nametofont("TkDefaultFont").actual("family")
+        log.info("[表示] フォント: %s", family)
 
-        # ===== 右側: チャット本体 =====
-        right = ttk.Frame(main)
-        right.pack(side="left", fill="both", expand=True)
+        # チャット欄・入力欄のフォント。文字サイズの変更は _set_font_size でまとめて行う
+        self.fonts = {
+            "chat": tkfont.Font(root=self.root, family=family, size=DEFAULT_FONT_SIZE),
+            "chat_bold": tkfont.Font(root=self.root, family=family, size=DEFAULT_FONT_SIZE, weight="bold"),
+            "small": tkfont.Font(root=self.root, family=family, size=DEFAULT_FONT_SIZE - 2),
+            "small_italic": tkfont.Font(
+                root=self.root, family=family, size=DEFAULT_FONT_SIZE - 2, slant="italic"
+            ),
+            "ui_bold": tkfont.Font(root=self.root, family=family, size=10, weight="bold"),
+        }
 
-        # 上段: モデル選択 + 読み込み + ステータス
-        top = ttk.Frame(right, padding=(8, 6))
-        top.pack(fill="x")
-        ttk.Label(top, text="モデル:").pack(side="left")
+        self.style.configure("Muted.TLabel", foreground=COLORS["muted"])
+        # 入力欄の中に重ねる案内文 (入力欄と同じ背景にする)
+        self.style.configure("Hint.TLabel", foreground=COLORS["muted"], background=COLORS["bg"])
+        self.style.configure("Accent.TButton", font=self.fonts["ui_bold"])
+        for kind in ("ok", "warn", "error", "muted"):
+            self.style.configure(f"State{kind.title()}.TLabel", foreground=COLORS[kind])
+        self.style.configure("Treeview", rowheight=26)
+
+    def _build_vars(self):
+        """UI の状態を持つ変数。設定ファイルとの読み書きにも使う。"""
         self.model_var = tk.StringVar()
+        self.temp_var = tk.DoubleVar(value=DEFAULT_TEMPERATURE)
+        self.top_p_var = tk.DoubleVar(value=DEFAULT_TOP_P)
+        self.top_k_var = tk.IntVar(value=DEFAULT_TOP_K)
+        self.maxtok_var = tk.IntVar(value=DEFAULT_MAX_TOKENS)
+        self.system_var = tk.StringVar(value="")
+        # 思考モード: システムプロンプト先頭に <|think|> を付けて有効化する
+        self.thinking_var = tk.BooleanVar(value=False)
+        self.show_thought_var = tk.BooleanVar(value=True)
+        # PDF は既定でテキスト優先 (抽出できなければ自動で画像化)。
+        # チェックすると常にページ画像として渡す (図表やレイアウトを見せたいとき)。
+        self.pdf_as_image_var = tk.BooleanVar(value=False)
+        self.show_settings_var = tk.BooleanVar(value=False)
+        self.font_size_var = tk.IntVar(value=DEFAULT_FONT_SIZE)
+        self.search_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="準備完了")
+        self.model_state_var = tk.StringVar(value="● 未読み込み")
+        self.ctx_var = tk.StringVar(value="")
+        self.attach_var = tk.StringVar(value="")
+
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="新規チャット", accelerator="Ctrl+N", command=self.on_new_chat)
+        file_menu.add_separator()
+        file_menu.add_command(label="ファイルを添付...", accelerator="Ctrl+O", command=self.on_attach)
+        file_menu.add_command(label="カメラから取り込む...", command=self.on_camera)
+        file_menu.add_separator()
+        file_menu.add_command(label="モデルフォルダを選ぶ...", command=self.on_choose_models_dir)
+        file_menu.add_separator()
+        file_menu.add_command(label="終了", command=self.on_close)
+        menubar.add_cascade(label="ファイル", menu=file_menu)
+
+        chat_menu = tk.Menu(menubar, tearoff=False)
+        chat_menu.add_command(label="停止", accelerator="Esc", command=self.on_stop)
+        chat_menu.add_command(label="再生成", accelerator="Ctrl+R", command=self.on_regenerate)
+        chat_menu.add_command(label="最後の回答をコピー", accelerator="Ctrl+Shift+C",
+                              command=self.copy_last_answer)
+        chat_menu.add_separator()
+        chat_menu.add_checkbutton(label="思考モード", variable=self.thinking_var)
+        menubar.add_cascade(label="チャット", menu=chat_menu)
+
+        view_menu = tk.Menu(menubar, tearoff=False)
+        view_menu.add_checkbutton(label="詳細設定を表示", variable=self.show_settings_var,
+                                  command=self._apply_settings_visibility)
+        view_menu.add_checkbutton(label="思考を表示", variable=self.show_thought_var,
+                                  command=self._apply_thought_visibility)
+        view_menu.add_separator()
+        view_menu.add_command(label="文字を大きく", accelerator="Ctrl++",
+                              command=lambda: self._zoom(1))
+        view_menu.add_command(label="文字を小さく", accelerator="Ctrl+-",
+                              command=lambda: self._zoom(-1))
+        view_menu.add_command(label="標準の大きさ", accelerator="Ctrl+0",
+                              command=lambda: self._set_font_size(DEFAULT_FONT_SIZE))
+        menubar.add_cascade(label="表示", menu=view_menu)
+        self.root.config(menu=menubar)
+
+    def _build_statusbar(self):
+        bar = ttk.Frame(self.root, padding=(10, 3))
+        bar.pack(side="bottom", fill="x")
+        ttk.Separator(self.root, orient="horizontal").pack(side="bottom", fill="x")
+        # モデルの状態 (未読み込み / 読み込み済み / モック / 失敗) を色付きで常に出しておく
+        self.model_state_label = ttk.Label(
+            bar, textvariable=self.model_state_var, style="StateMuted.TLabel"
+        )
+        self.model_state_label.pack(side="left")
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Label(bar, textvariable=self.status_var).pack(side="left")
+        # 読み込み・生成中だけ動かす (待っていることが分かるように)
+        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
+        self.ctx_label = ttk.Label(bar, textvariable=self.ctx_var, style="Muted.TLabel")
+        self.ctx_label.pack(side="right")
+
+    def _build_sidebar(self, parent):
+        ttk.Button(
+            parent, text="＋ 新規チャット", style="Accent.TButton", command=self.on_new_chat
+        ).pack(fill="x")
+
+        ttk.Label(parent, text="会話履歴", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
+        search = ttk.Entry(parent, textvariable=self.search_var)
+        search.pack(fill="x", pady=(0, 4))
+        self.search_var.trace_add("write", lambda *a: self._refresh_sidebar())
+        self._add_entry_hint(search, self.search_var, "タイトルで絞り込み")
+
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill="both", expand=True)
+        # 単一選択で会話を開く。Ctrl / Shift + クリックで複数選んでまとめて削除できる
+        self.session_tree = ttk.Treeview(
+            wrap, columns=("updated",), show="tree", selectmode="extended"
+        )
+        self.session_tree.column("#0", width=150, stretch=True)
+        self.session_tree.column("updated", width=70, anchor="e", stretch=False)
+        self.session_tree.tag_configure("current", font=self.fonts["ui_bold"])
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.session_tree.yview)
+        self.session_tree.configure(yscrollcommand=vsb.set)
+        self.session_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.session_tree.bind("<<TreeviewSelect>>", self._on_session_select)
+        self.session_tree.bind("<Delete>", lambda e: self.on_delete_selected())
+        self.session_tree.bind(self._context_click(), self._show_session_menu)
+
+        self.session_menu = tk.Menu(self.root, tearoff=False)
+        self.session_menu.add_command(label="開く", command=self._open_selected_session)
+        self.session_menu.add_command(label="削除", command=self.on_delete_selected)
+
+        self.delete_btn = ttk.Button(
+            parent, text="選択した会話を削除", command=self.on_delete_selected, state="disabled"
+        )
+        self.delete_btn.pack(fill="x", pady=(6, 0))
+        ttk.Label(
+            parent, text="Ctrl / Shift + クリックで複数選択", style="Muted.TLabel"
+        ).pack(anchor="w", pady=(2, 0))
+
+    def _build_header(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        # 幅が足りないときはモデル一覧が縮む (右端のボタンが切れないように)
+        top.columnconfigure(1, weight=1, minsize=160)
+        ttk.Label(top, text="モデル").grid(row=0, column=0, padx=(0, 6))
         self.model_combo = ttk.Combobox(
-            top, textvariable=self.model_var, state="readonly", width=42
+            top, textvariable=self.model_var, state="readonly", width=24
         )
         self.model_combo["values"] = discover_models()
         if self.model_combo["values"]:
             self.model_combo.current(0)
-        self.model_combo.pack(side="left", padx=4)
-        self.load_btn = ttk.Button(top, text="読み込み", command=self.on_load)
-        self.load_btn.pack(side="left", padx=4)
-        ttk.Button(top, text="フォルダ...", command=self.on_choose_models_dir).pack(side="left")
-        self.status_var = tk.StringVar(value="未読み込み")
-        ttk.Label(top, textvariable=self.status_var, foreground="#0066cc").pack(
-            side="left", padx=8
+        self.model_combo.grid(row=0, column=1, sticky="ew")
+        # ttk ボタンの既定幅 (11 文字) は広すぎるので、負の値 (= 最小幅) で詰める
+        self.load_btn = ttk.Button(top, text="読み込み", width=-8, command=self.on_load)
+        self.load_btn.grid(row=0, column=2, padx=(4, 0))
+        ttk.Button(top, text="フォルダ...", width=-8, command=self.on_choose_models_dir).grid(
+            row=0, column=3, padx=(4, 0)
+        )
+        self.settings_btn = ttk.Button(top, width=-7, command=self.toggle_settings)
+        self.settings_btn.grid(row=0, column=4, padx=(10, 0))
+
+    def _build_settings_panel(self, parent):
+        """サンプリングとシステムプロンプト。普段は畳んでおき、必要なときだけ開く。"""
+        self.settings_panel = ttk.LabelFrame(parent, text="詳細設定", padding=(10, 6))
+        panel = self.settings_panel
+        panel.columnconfigure(1, weight=1)
+
+        ttk.Label(panel, text="システムプロンプト").grid(row=0, column=0, sticky="w")
+        ttk.Entry(panel, textvariable=self.system_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0)
         )
 
-        # オプション段 1: サンプリング (既定値は Gemma 4 の推奨値)
-        opt = ttk.Frame(right, padding=(8, 0))
-        opt.pack(fill="x")
-        ttk.Label(opt, text="temperature:").pack(side="left")
-        self.temp_var = tk.DoubleVar(value=DEFAULT_TEMPERATURE)
-        ttk.Spinbox(
-            opt, from_=0.0, to=2.0, increment=0.1, width=5, textvariable=self.temp_var
-        ).pack(side="left", padx=(2, 10))
-        ttk.Label(opt, text="top_p:").pack(side="left")
-        self.top_p_var = tk.DoubleVar(value=DEFAULT_TOP_P)
-        ttk.Spinbox(
-            opt, from_=0.0, to=1.0, increment=0.05, width=5, textvariable=self.top_p_var
-        ).pack(side="left", padx=(2, 10))
-        ttk.Label(opt, text="top_k:").pack(side="left")
-        self.top_k_var = tk.IntVar(value=DEFAULT_TOP_K)
-        ttk.Spinbox(
-            opt, from_=1, to=200, increment=1, width=5, textvariable=self.top_k_var
-        ).pack(side="left", padx=(2, 10))
-        ttk.Label(opt, text="max_tokens:").pack(side="left")
-        self.maxtok_var = tk.IntVar(value=DEFAULT_MAX_TOKENS)
-        ttk.Spinbox(
-            opt, from_=16, to=8192, increment=16, width=6, textvariable=self.maxtok_var
-        ).pack(side="left", padx=2)
-
-        # オプション段 2: システムプロンプト / 思考モード
-        sysrow = ttk.Frame(right, padding=(8, 4))
-        sysrow.pack(fill="x")
-        ttk.Label(sysrow, text="システムプロンプト:").pack(side="left")
-        self.system_var = tk.StringVar(value="")
-        ttk.Entry(sysrow, textvariable=self.system_var).pack(
-            side="left", fill="x", expand=True, padx=(4, 8)
+        # 狭い画面でも切れないよう、数値は 2 列ずつ並べる
+        nums = ttk.Frame(panel)
+        nums.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        spins = (
+            ("temperature", self.temp_var, 0.0, 2.0, 0.1),
+            ("top_p", self.top_p_var, 0.0, 1.0, 0.05),
+            ("top_k", self.top_k_var, 1, 200, 1),
+            ("max_tokens", self.maxtok_var, 16, 8192, 16),
         )
-        # 思考モード: システムプロンプト先頭に <|think|> を付けて有効化する
-        self.thinking_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(sysrow, text="思考モード", variable=self.thinking_var).pack(side="left")
-        self.show_thought_var = tk.BooleanVar(value=True)
+        for i, (label, var, lo, hi, step) in enumerate(spins):
+            row, col = divmod(i, 2)
+            ttk.Label(nums, text=label).grid(row=row, column=col * 2, sticky="w", pady=2)
+            ttk.Spinbox(
+                nums, from_=lo, to=hi, increment=step, width=6, textvariable=var
+            ).grid(row=row, column=col * 2 + 1, sticky="w", padx=(6, 12), pady=2)
+        nums.columnconfigure(4, weight=1)
+        ttk.Button(nums, text="既定値に戻す", width=-10, command=self.reset_sampling).grid(
+            row=0, column=5, sticky="e"
+        )
         ttk.Checkbutton(
-            sysrow, text="思考を表示", variable=self.show_thought_var,
-            command=self._apply_thought_visibility,
-        ).pack(side="left", padx=(4, 0))
+            nums, text="PDFを画像として読む", variable=self.pdf_as_image_var
+        ).grid(row=1, column=5, sticky="e")
 
-        # 中段: チャット履歴表示
-        self.chat = scrolledtext.ScrolledText(
-            right, wrap="word", state="disabled", font=("", 11)
+        hint = ttk.Label(
+            panel,
+            text=("既定値は Gemma 4 の推奨値です。max_tokens は回答に使える長さで、"
+                  "思考モードでは思考のぶんが自動で上乗せされます"),
+            style="Muted.TLabel", justify="left", wraplength=360,
         )
-        self.chat.pack(fill="both", expand=True, padx=8, pady=6)
-        self.chat.tag_config("user", foreground="#1a7f37", font=("", 11, "bold"))
-        self.chat.tag_config("assistant", foreground="#0a3069")
-        self.chat.tag_config("system", foreground="#999999", font=("", 9, "italic"))
-        self.chat.tag_config("thought", foreground="#8250df", font=("", 9, "italic"))
+        hint.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        # 折り返し幅をパネルの幅に合わせる
+        panel.bind("<Configure>", lambda e: hint.config(wraplength=max(200, e.width - 40)))
+
+    def _build_chat_view(self, parent):
+        self.chat_frame = ttk.Frame(parent)
+        self.chat_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.chat = scrolledtext.ScrolledText(
+            self.chat_frame, wrap="word", state="disabled", font=self.fonts["chat"], width=40,
+            relief="flat", borderwidth=0, padx=16, pady=12,
+            background=COLORS["bg"], foreground=COLORS["text"],
+            highlightthickness=1, highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["border"],
+        )
+        self.chat.pack(fill="both", expand=True)
+        chat = self.chat
+        chat.tag_config("user_head", foreground=COLORS["user_head"], font=self.fonts["chat_bold"],
+                        spacing1=14, spacing3=4)
+        chat.tag_config("assistant_head", foreground=COLORS["assistant_head"],
+                        font=self.fonts["chat_bold"], spacing1=14, spacing3=4)
+        # 自分の発話は背景色で区別する (行末の改行まで含めると右端まで塗られる)
+        chat.tag_config("user", background=COLORS["user_bg"], lmargin1=10, lmargin2=10,
+                        rmargin=10, spacing2=3)
+        chat.tag_config("assistant", lmargin1=10, lmargin2=10, rmargin=10, spacing2=3)
+        chat.tag_config("thought", foreground=COLORS["thought"], font=self.fonts["small_italic"],
+                        lmargin1=22, lmargin2=22, spacing2=2)
+        chat.tag_config("thought_head", font=self.fonts["small"], spacing1=4, spacing3=2)
+        chat.tag_config("system", foreground=COLORS["muted"], font=self.fonts["small"],
+                        justify="center", spacing1=6, spacing3=6)
+        chat.tag_config("error", foreground=COLORS["error"], font=self.fonts["small"],
+                        justify="center", spacing1=6, spacing3=6)
         self._apply_thought_visibility()
 
-        # 下段: 添付行 + 入力欄 + 送信
-        bottom = ttk.Frame(right, padding=(8, 6))
-        bottom.pack(fill="x")
+        # 無効状態の Text はクリックでフォーカスを取らないため、コピーできるように取らせる
+        chat.bind("<Button-1>", lambda e: chat.focus_set(), add="+")
+        self.chat_menu = tk.Menu(self.root, tearoff=False)
+        self.chat_menu.add_command(label="コピー", accelerator="Ctrl+C", command=self.copy_selection)
+        self.chat_menu.add_command(label="すべて選択", accelerator="Ctrl+A", command=self.select_all_chat)
+        self.chat_menu.add_separator()
+        self.chat_menu.add_command(label="最後の回答をコピー", command=self.copy_last_answer)
+        chat.bind(self._context_click(), self._show_chat_menu)
+        chat.bind("<Control-a>", lambda e: self.select_all_chat() or "break")
 
-        attach_row = ttk.Frame(bottom)
-        attach_row.pack(fill="x", pady=(0, 4))
-        self.attach_btn = ttk.Button(attach_row, text="ファイル添付", command=self.on_attach)
-        self.attach_btn.pack(side="left")
-        self.camera_btn = ttk.Button(attach_row, text="カメラ", command=self.on_camera)
-        self.camera_btn.pack(side="left", padx=4)
-        self.attach_clear_btn = ttk.Button(
-            attach_row, text="解除", command=self.on_clear_attachments, state="disabled"
-        )
-        self.attach_clear_btn.pack(side="left", padx=4)
-        # PDF は既定でテキスト優先 (抽出できなければ自動で画像化)。
-        # チェックすると常にページ画像として渡す (図表やレイアウトを見せたいとき)。
-        self.pdf_as_image_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            attach_row, text="PDFを画像として読む", variable=self.pdf_as_image_var
-        ).pack(side="left", padx=(8, 0))
-        self.attach_var = tk.StringVar(value="添付なし")
-        ttk.Label(attach_row, textvariable=self.attach_var, foreground="#666666").pack(
-            side="left", padx=6
-        )
-        # 生成の制御は右寄せ (生成中のみ停止、生成後のみ再生成が押せる)
-        self.stop_btn = ttk.Button(
-            attach_row, text="停止", command=self.on_stop, state="disabled"
-        )
-        self.stop_btn.pack(side="right")
+    def _build_composer(self, parent):
+        box = ttk.Frame(parent, padding=(0, 8, 0, 0))
+        box.pack(side="bottom", fill="x")
+
+        tools = ttk.Frame(box)
+        tools.pack(fill="x")
+        # 右端のボタンを先に置く (狭いときに左側の項目より先に切れないように)
         self.regen_btn = ttk.Button(
-            attach_row, text="再生成", command=self.on_regenerate, state="disabled"
+            tools, text="↻ 再生成", width=-8, command=self.on_regenerate, state="disabled"
         )
-        self.regen_btn.pack(side="right", padx=4)
+        self.regen_btn.pack(side="right")
+        self.attach_btn = ttk.Button(tools, text="ファイル添付...", width=-8, command=self.on_attach)
+        self.attach_btn.pack(side="left")
+        self.camera_btn = ttk.Button(tools, text="カメラ...", width=-8, command=self.on_camera)
+        self.camera_btn.pack(side="left", padx=(4, 0))
+        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
+        ttk.Checkbutton(tools, text="思考モード", variable=self.thinking_var).pack(side="left")
+        ttk.Checkbutton(
+            tools, text="思考を表示", variable=self.show_thought_var,
+            command=self._apply_thought_visibility,
+        ).pack(side="left", padx=(8, 0))
 
-        entry_row = ttk.Frame(bottom)
-        entry_row.pack(fill="x")
-        self.input = tk.Text(entry_row, height=3, wrap="word", font=("", 11))
-        self.input.pack(side="left", fill="x", expand=True)
+        # 添付一覧 (添付があるときだけ表示する)
+        self.attach_row = ttk.Frame(box)
+        ttk.Label(self.attach_row, textvariable=self.attach_var, style="Muted.TLabel").pack(
+            side="left"
+        )
+        self.attach_clear_btn = ttk.Button(
+            self.attach_row, text="添付を解除", command=self.on_clear_attachments
+        )
+        self.attach_clear_btn.pack(side="right")
+
+        self.entry_row = ttk.Frame(box)
+        self.entry_row.pack(fill="x", pady=(6, 0))
+        # 生成中は「停止」ボタンに切り替わる。入力欄より先に置いて、狭くても隠れないようにする
+        self.send_btn = ttk.Button(
+            self.entry_row, text="送信", style="Accent.TButton", width=8, command=self.on_send
+        )
+        self.send_btn.pack(side="right", fill="y", padx=(6, 0))
+        self.input = tk.Text(
+            self.entry_row, height=3, width=20, wrap="word", font=self.fonts["chat"], undo=True,
+            relief="flat", borderwidth=0, padx=8, pady=6,
+            highlightthickness=1, highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
+        self.input.pack(side="left", fill="both", expand=True)
+        self.input.tag_config("placeholder", foreground=COLORS["muted"])
         # Enter で送信 / Shift+Enter で改行
         self.input.bind("<Return>", lambda e: self.on_send())
         self.input.bind("<Shift-Return>", self._insert_newline)
-        self.send_btn = ttk.Button(entry_row, text="送信\n(Enter)", command=self.on_send)
-        self.send_btn.pack(side="left", padx=4, fill="y")
+        self.input.bind("<FocusIn>", lambda e: self._hide_placeholder())
+        self.input.bind("<FocusOut>", lambda e: self._show_placeholder())
+        self._show_placeholder()
+        self._refresh_attachments()
+
+    def _bind_shortcuts(self):
+        """キーボードショートカット。Text の既定バインド (Ctrl+O で改行など) より優先させる。"""
+        keys = {
+            "<Control-n>": self.on_new_chat,
+            "<Control-o>": self.on_attach,
+            "<Control-r>": self.on_regenerate,
+            "<Control-Shift-C>": self.copy_last_answer,  # CapsLock 中の Ctrl+C と区別するため Shift を明示
+            "<Escape>": self.on_stop,
+            "<Control-plus>": lambda: self._zoom(1),
+            "<Control-equal>": lambda: self._zoom(1),    # JIS / US 配列で + は Shift が要るため
+            "<Control-semicolon>": lambda: self._zoom(1),
+            "<Control-KP_Add>": lambda: self._zoom(1),
+            "<Control-minus>": lambda: self._zoom(-1),
+            "<Control-KP_Subtract>": lambda: self._zoom(-1),
+            "<Control-0>": lambda: self._set_font_size(DEFAULT_FONT_SIZE),
+        }
+        def run(handler):
+            handler()
+            return "break"          # 後続 (Text クラスの既定バインド) を止める
+
+        for seq, handler in keys.items():
+            self.input.bind(seq, lambda e, h=handler: run(h))
+            self.root.bind(seq, lambda e, h=handler: run(h))
+        for widget in (self.chat, self.input):
+            widget.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+            widget.bind("<Control-Button-4>", lambda e: self._zoom(1) or "break")
+            widget.bind("<Control-Button-5>", lambda e: self._zoom(-1) or "break")
+
+    # ---- UI の小物 -------------------------------------------------------
+    @staticmethod
+    def _context_click():
+        """右クリックのイベント名 (macOS は Button-2)。"""
+        return "<Button-2>" if sys.platform == "darwin" else "<Button-3>"
+
+    def _add_entry_hint(self, entry, var, hint):
+        """ttk.Entry に案内文を出す (未入力かつフォーカスが無いとき)。"""
+        label = ttk.Label(entry, text=hint, style="Hint.TLabel", cursor="xterm")
+        label.bind("<Button-1>", lambda e: entry.focus_set())
+
+        def update(*_):
+            if var.get() or entry.focus_get() is entry:
+                label.place_forget()
+            else:
+                label.place(x=4, rely=0.5, anchor="w")
+
+        entry.bind("<FocusIn>", update, add="+")
+        entry.bind("<FocusOut>", update, add="+")
+        var.trace_add("write", update)
+        update()
+
+    def _show_placeholder(self):
+        """入力欄が空なら案内文を出す。"""
+        if self._placeholder_on or self.input.get("1.0", "end-1c"):
+            return
+        self.input.insert("1.0", "メッセージを入力  (Enter で送信 / Shift+Enter で改行)", "placeholder")
+        self._placeholder_on = True
+
+    def _hide_placeholder(self):
+        if self._placeholder_on:
+            self.input.delete("1.0", "end")
+            self._placeholder_on = False
+
+    def _input_text(self):
+        """入力欄の文字列 (案内文は除く)。"""
+        if self._placeholder_on:
+            return ""
+        return self.input.get("1.0", "end").strip()
+
+    def _zoom(self, step):
+        self._set_font_size(int(self.font_size_var.get()) + step)
+
+    def _on_ctrl_wheel(self, event):
+        self._zoom(1 if event.delta > 0 else -1)
+        return "break"
+
+    def _set_font_size(self, size):
+        """チャット欄・入力欄の文字サイズを変える (名前付きフォントなので表示中の文字も追従する)。"""
+        size = max(FONT_SIZE_MIN, min(FONT_SIZE_MAX, int(size)))
+        self.font_size_var.set(size)
+        self.fonts["chat"].configure(size=size)
+        self.fonts["chat_bold"].configure(size=size)
+        self.fonts["small"].configure(size=max(FONT_SIZE_MIN, size - 2))
+        self.fonts["small_italic"].configure(size=max(FONT_SIZE_MIN, size - 2))
+
+    def toggle_settings(self):
+        self.show_settings_var.set(not self.show_settings_var.get())
+        self._apply_settings_visibility()
+
+    def _apply_settings_visibility(self):
+        """詳細設定パネルの開閉。"""
+        if self.show_settings_var.get():
+            self.settings_panel.pack(fill="x", pady=(8, 0), before=self.chat_frame)
+            self.settings_btn.config(text="設定 ▲")
+        else:
+            self.settings_panel.pack_forget()
+            self.settings_btn.config(text="設定 ▼")
+
+    def reset_sampling(self):
+        """サンプリングを既定値 (Gemma 4 の推奨値) に戻す。"""
+        self.temp_var.set(DEFAULT_TEMPERATURE)
+        self.top_p_var.set(DEFAULT_TOP_P)
+        self.top_k_var.set(DEFAULT_TOP_K)
+        self.maxtok_var.set(DEFAULT_MAX_TOKENS)
+        self.status_var.set("サンプリングを既定値に戻しました")
+
+    def _set_model_state(self, text, kind):
+        """ヘッダーのモデル状態表示。kind は ok / warn / error / muted。"""
+        self.model_state_var.set(f"● {text}")
+        self.model_state_label.config(style=f"State{kind.title()}.TLabel")
+
+    def _set_busy(self, busy):
+        """読み込み・生成中はステータスバーの進行表示を動かす。"""
+        if busy:
+            self.progress.pack(side="left", padx=(10, 0))
+            self.progress.start(15)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
+
+    def _show_welcome(self):
+        if self.engine.model_name is None:
+            self._append_system(
+                "上の一覧からモデルを選んで「読み込み」を押すと会話を始められます"
+                " (サンプリング等は右上の「設定」、文字の大きさは Ctrl + / Ctrl -)"
+            )
+
+    def _show_chat_menu(self, event):
+        self.chat.focus_set()
+        try:
+            self.chat_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.chat_menu.grab_release()
+
+    def copy_selection(self):
+        try:
+            text = self.chat.get("sel.first", "sel.last")
+        except tk.TclError:
+            self.status_var.set("コピーする範囲を選択してください")
+            return
+        self._to_clipboard(text, "選択範囲をコピーしました")
+
+    def select_all_chat(self):
+        self.chat.tag_add("sel", "1.0", "end-1c")
+
+    def copy_last_answer(self):
+        """直近の AI の回答をクリップボードへ。"""
+        last = next((m for m in reversed(self.history) if m["role"] == "assistant"), None)
+        if last is None:
+            self.status_var.set("コピーできる回答がありません")
+            return
+        self._to_clipboard(plain_content(last["content"]), "最後の回答をコピーしました")
+
+    def _to_clipboard(self, text, message):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(message)
 
     # ---- アプリ設定 (新しいチャットの初期値) ----------------------------
     def _settings_fields(self):
@@ -1182,6 +1584,8 @@ class ChatApp:
             "top_k": (self.top_k_var, int),
             "max_tokens": (self.maxtok_var, int),
             "model": (self.model_var, str),
+            "show_settings": (self.show_settings_var, bool),
+            "font_size": (self.font_size_var, int),
         }
 
     def _load_settings(self):
@@ -1190,8 +1594,6 @@ class ChatApp:
         モデルフォルダだけは UI を組み立てる前に要るので、__init__ で先に反映済み。
         """
         data = load_settings_file()
-        if not data:
-            return
         for key, (var, cast) in self._settings_fields().items():
             if key not in data:
                 continue
@@ -1204,11 +1606,20 @@ class ChatApp:
                 continue
             var.set(value)
         self._apply_thought_visibility()
-        log.info("[設定] 復元: %s", SETTINGS_PATH)
+        self._apply_settings_visibility()
+        self._set_font_size(self.font_size_var.get())
+        if data:
+            log.info("[設定] 復元: %s", SETTINGS_PATH)
 
     def _save_settings(self):
         """現在の設定を次回起動用に保存する。"""
-        data = {key: cast(var.get()) for key, (var, cast) in self._settings_fields().items()}
+        data = {}
+        for key, (var, cast) in self._settings_fields().items():
+            try:
+                data[key] = cast(var.get())
+            except (TypeError, ValueError, tk.TclError):
+                # Spinbox に数値でない文字が入っている等。その項目は保存しない
+                log.warning("[設定] %s の値が不正なため保存しません", key)
         data["models_dir"] = str(MODELS_DIR)
         try:
             SETTINGS_PATH.write_text(
@@ -1228,8 +1639,11 @@ class ChatApp:
         return "新しいチャット"
 
     def _save_current(self):
-        """現在の会話を保存する (空なら何もしない)。"""
-        if not self.history:
+        """現在の会話を保存する (空、または前回保存から変わっていなければ何もしない)。
+
+        開いただけの会話を保存し直すと更新日時が変わり、一覧の並びが入れ替わってしまう。
+        """
+        if not self.history or not self._dirty:
             return
         if self.current_id is None:
             self.current_id = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
@@ -1249,30 +1663,61 @@ class ChatApp:
                 for m in self.history
             ],
         })
+        self._dirty = False
 
     def _refresh_sidebar(self):
-        """保存済み会話の一覧を再描画する。"""
-        for child in self.list_frame.winfo_children():
-            child.destroy()
-        self.session_rows = []
+        """保存済み会話の一覧を再描画する (検索欄の文字で絞り込む)。"""
+        tree = self.session_tree
+        tree.delete(*tree.get_children())
+        query = self.search_var.get().strip().lower()
         for meta in self.store.list_meta():
-            row = ttk.Frame(self.list_frame)
-            row.pack(fill="x", pady=1)
-            var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(row, variable=var).pack(side="left")
             title = meta["title"] or "(無題)"
-            if meta["id"] == self.current_id:
-                title = "▶ " + title          # 現在開いている会話に印
-            ttk.Button(
-                row, text=title, width=22,
-                command=lambda sid=meta["id"]: self.on_load_session(sid),
-            ).pack(side="left", fill="x", expand=True)
-            self.session_rows.append((var, meta))
+            if query and query not in title.lower():
+                continue
+            tree.insert(
+                "", "end", iid=meta["id"], text=title,
+                values=(format_updated(meta["updated"]),),
+                tags=("current",) if meta["id"] == self.current_id else (),
+            )
+        # 開いている会話を選択状態にしておく (どれを見ているか分かるように)
+        if self.current_id and tree.exists(self.current_id):
+            tree.selection_set(self.current_id)
+            tree.see(self.current_id)
+        self._refresh_delete_button()
+
+    def _refresh_delete_button(self):
+        selected = self.session_tree.selection()
+        self.delete_btn.config(state="normal" if selected else "disabled")
+        self.delete_btn.config(
+            text=f"選択した {len(selected)} 件を削除" if len(selected) > 1 else "選択した会話を削除"
+        )
+
+    def _on_session_select(self, event=None):
+        """一覧で 1 件だけ選ばれたら、その会話を開く (複数選択は削除用)。"""
+        self._refresh_delete_button()
+        selected = self.session_tree.selection()
+        if len(selected) == 1 and selected[0] != self.current_id:
+            self.on_load_session(selected[0])
+
+    def _open_selected_session(self):
+        selected = self.session_tree.selection()
+        if selected:
+            self.on_load_session(selected[0])
+
+    def _show_session_menu(self, event):
+        row = self.session_tree.identify_row(event.y)
+        if row and row not in self.session_tree.selection():
+            self.session_tree.selection_set(row)
+        try:
+            self.session_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.session_menu.grab_release()
 
     def _start_new_session(self):
         self.history = []
         self.current_id = None
         self.current_created = None
+        self._dirty = False
         self.attachments = []
         self._refresh_attachments()
         self.chat.config(state="normal")
@@ -1292,18 +1737,23 @@ class ChatApp:
         self._save_current()          # 開いていた会話を保存
         self._start_new_session()
         self._refresh_sidebar()
-        self._append_system("新しいチャットを開始しました")
+        self._show_welcome()
+        self.status_var.set("新しいチャット")
+        self.input.focus_set()
         log.info("[UI] 新規チャット")
 
     def on_load_session(self, session_id):
         """サイドバーの会話をクリック -> 再開。"""
         if self.generating:
+            self.status_var.set("生成中は会話を切り替えられません")
+            self._refresh_sidebar()       # 選択表示を今の会話に戻す
             return
         self._save_current()          # 今の会話を保存してから切り替え
         data = self.store.load(session_id)
         self.history = data.get("messages", [])
         self.current_id = data["id"]
         self.current_created = data.get("created", time.time())
+        self._dirty = False
         self.system_var.set(data.get("system_prompt", ""))
         self.thinking_var.set(bool(data.get("thinking", False)))
         self._repaint_chat()
@@ -1313,20 +1763,28 @@ class ChatApp:
         log.info("[UI] 会話を再開: %s (%d発話)", session_id, len(self.history))
 
     def on_delete_selected(self):
-        """チェックされた会話をまとめて削除。"""
+        """選択された会話をまとめて削除。"""
         if self.generating:
             return
-        ids = [meta["id"] for var, meta in self.session_rows if var.get()]
+        ids = list(self.session_tree.selection())
         if not ids:
-            self._append_system("削除する履歴にチェックを入れてください")
+            self.status_var.set("削除する会話を一覧から選んでください")
             return
-        if not messagebox.askyesno("確認", f"{len(ids)} 件の会話を削除します。よろしいですか?"):
+        titles = [self.session_tree.item(sid, "text") for sid in ids[:5]]
+        more = f"\nほか {len(ids) - 5} 件" if len(ids) > 5 else ""
+        if not messagebox.askyesno(
+            "会話の削除",
+            f"{len(ids)} 件の会話を削除します。元に戻せません。\n\n"
+            + "\n".join(f"・{t}" for t in titles) + more,
+            icon="warning",
+        ):
             return
         for sid in ids:
             self.store.delete(sid)
             if sid == self.current_id:
                 self._start_new_session()
         self._refresh_sidebar()
+        self.status_var.set(f"{len(ids)} 件の会話を削除しました")
         log.info("[UI] %d 件の履歴を削除", len(ids))
 
     # ---- ハンドラ --------------------------------------------------------
@@ -1336,6 +1794,8 @@ class ChatApp:
             return
         self.load_btn.config(state="disabled")
         self.status_var.set(f"読み込み中: {name} ...")
+        self._set_model_state("読み込み中", "muted")
+        self._set_busy(True)
         self._append_system(f"モデル読み込み中: {name}")
         log.info("[UI] 読み込みボタン押下 -> %s", name)
         threading.Thread(
@@ -1359,6 +1819,7 @@ class ChatApp:
         else:
             self.model_var.set("")
         self._append_system(f"モデルフォルダ: {MODELS_DIR.resolve()} ({len(models)} 件)")
+        self.status_var.set(f"モデル {len(models)} 件")
         self._save_settings()
         if MODELS_DIR_FROM_ENV:
             self._append_system(
@@ -1488,16 +1949,16 @@ class ChatApp:
         self._refresh_attachments()
 
     def _refresh_attachments(self):
-        """添付一覧のラベルと解除ボタンの状態を更新する。"""
+        """添付一覧の行を更新する (添付が無ければ隠す)。"""
         if not self.attachments:
-            self.attach_var.set("添付なし")
-            self.attach_clear_btn.config(state="disabled")
+            self.attach_var.set("")
+            self.attach_row.pack_forget()
             return
         names = ", ".join(a["name"] for a in self.attachments)
         if len(names) > ATTACH_LABEL_MAXLEN:
             names = names[:ATTACH_LABEL_MAXLEN] + "…"
         self.attach_var.set(f"添付 {len(self.attachments)} 件: {names}")
-        self.attach_clear_btn.config(state="normal")
+        self.attach_row.pack(fill="x", pady=(6, 0), before=self.entry_row)
 
     def _build_content(self, text):
         """入力文と添付から送信用の content を組み立てる。
@@ -1536,11 +1997,12 @@ class ChatApp:
         if self.generating:
             log.debug("[UI] 生成中のため送信を無視")
             return "break"
-        text = self.input.get("1.0", "end").strip()
+        text = self._input_text()
         if not text and not self.attachments:
             return "break"
         if self.engine.model_name is None:
-            self._append_system("先にモデルを読み込んでください")
+            self._append_system("先にモデルを読み込んでください (上の「読み込み」ボタン)")
+            self.load_btn.focus_set()
             log.warning("[UI] モデル未読み込みで送信されました")
             return "break"
 
@@ -1551,9 +2013,11 @@ class ChatApp:
             return "break"
 
         self.input.delete("1.0", "end")
+        self.input.edit_reset()         # 送信済みの文を Ctrl+Z で戻さない
         self.attachments = []
         self._refresh_attachments()
         self.history.append({"role": "user", "content": content})
+        self._dirty = True
         self._append_message("user", plain_content(content), content_images(content))
         log.info(
             "[UI] 送信: %d 文字 / 画像 %d 枚 / 履歴 %d 件",
@@ -1578,6 +2042,7 @@ class ChatApp:
             self._append_system("再生成できる応答がありません")
             return
         self.history = self.history[:last]
+        self._dirty = True
         self._repaint_chat()
         log.info("[UI] 再生成 (履歴 %d 件から)", len(self.history))
         self._start_generation()
@@ -1587,7 +2052,7 @@ class ChatApp:
         if not self.generating:
             return
         self._stop_event.set()
-        self.stop_btn.config(state="disabled")
+        self.send_btn.config(state="disabled")
         self.status_var.set("停止中 ...")
         log.info("[UI] 停止要求")
 
@@ -1647,11 +2112,12 @@ class ChatApp:
         self._stop_event.clear()
         self._in_thought = False        # 思考チャネルを表示中か
         self._answer_started = False    # 回答の最初のトークンを出したか
-        self.send_btn.config(state="disabled")
+        # 送信ボタンは生成中だけ「停止」になる (Esc でも止められる)
+        self.send_btn.config(text="■ 停止", command=self.on_stop, state="normal")
         self.regen_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self.status_var.set("生成中 ...")
-        self._append_message("assistant", "")  # "AI: " の見出しだけ先に表示
+        self.status_var.set("生成中 ...  (Esc で停止)")
+        self._set_busy(True)
+        self._append_message("assistant", "")  # "AI" の見出しだけ先に表示
 
         threading.Thread(
             target=self._gen_worker, args=(messages, params), name="gen", daemon=True,
@@ -1743,13 +2209,15 @@ class ChatApp:
                     # 思考は表示するだけで履歴には残さない (次のターンへは渡さない)
                     if not self._in_thought:
                         self._in_thought = True
-                        self._stream_token("[思考]\n", "thought")
+                        self._stream_token("思考\n", ("thought", "thought_head"))
+                        payload = payload.lstrip("\n")
                     self._stream_token(payload, "thought")
                 elif kind in ("end", "stopped"):
                     if self._assistant_buf:
                         self.history.append(
                             {"role": "assistant", "content": self._assistant_buf}
                         )
+                        self._dirty = True
                     self._assistant_buf = ""
                     truncated = payload.get("finish") == "length"
                     if kind == "stopped":
@@ -1768,7 +2236,7 @@ class ChatApp:
                     self._save_current()        # 1往復ごとに自動保存
                     self._refresh_sidebar()
                 elif kind == "error":
-                    self._append_system(f"エラー: {payload}")
+                    self._append_system(f"エラー: {payload}", error=True)
                     if "context window" in payload.lower():
                         self._append_system(
                             "入力と max_tokens の合計がコンテキスト長を超えています。"
@@ -1777,12 +2245,21 @@ class ChatApp:
                     self._assistant_buf = ""
                     self._finish_generation("エラー")
                 elif kind == "loaded":
+                    self._set_busy(False)
                     self.status_var.set(payload)
                     self._append_system(payload)
                     self.load_btn.config(state="normal")
+                    if self.engine.llm is not None:
+                        self._set_model_state("読み込み済み", "ok")
+                    else:
+                        self._set_model_state("モックモード", "warn")
+                    self._refresh_context_usage()
+                    self.input.focus_set()
                 elif kind == "load_error":
+                    self._set_busy(False)
                     self.status_var.set("読み込み失敗")
-                    self._append_system(f"モデル読み込み失敗: {payload}")
+                    self._set_model_state("読み込み失敗", "error")
+                    self._append_system(f"モデル読み込み失敗: {payload}", error=True)
                     self.load_btn.config(state="normal")
         except queue.Empty:
             pass
@@ -1799,18 +2276,29 @@ class ChatApp:
                 m["role"], plain_content(m["content"]), content_images(m["content"])
             )
 
+    def _ensure_newline(self):
+        """直前の出力が行の途中で終わっていれば改行する (見出しを行頭から始めるため)。"""
+        if self.chat.get("1.0", "end-1c") and self.chat.get("end-2c", "end-1c") != "\n":
+            self.chat.insert("end", "\n")
+
     def _append_message(self, role, text, images=()):
         label = {"user": "あなた", "assistant": "AI"}.get(role, role)
+        tag = role if role in ("user", "assistant") else "assistant"
         self.chat.config(state="normal")
-        self.chat.insert("end", f"\n{label}: ", role)
+        self._ensure_newline()
+        self.chat.insert("end", label + "\n", f"{tag}_head")
         if text:
-            self.chat.insert("end", text, role)
+            self.chat.insert("end", text, tag)
         for data in images:
-            self._insert_thumbnail(data)
+            self._insert_thumbnail(data, tag)
+        if role == "user":
+            # 行末の改行まで背景色のタグに含めると、右端まで塗られて吹き出しのように見える
+            self._ensure_newline()
+            self.chat.tag_add(tag, "end-2c", "end-1c")
         self.chat.config(state="disabled")
         self.chat.see("end")
 
-    def _insert_thumbnail(self, data):
+    def _insert_thumbnail(self, data, tag="user"):
         """チャット欄に画像を小さく貼る。作れなければ何もしない。"""
         thumbnail = thumbnail_png(data)
         if thumbnail is None:
@@ -1822,9 +2310,9 @@ class ChatApp:
             return
         # PhotoImage は参照が切れると表示が消えるため、アプリ側で持ち続ける
         self._thumbnails.append(photo)
-        self.chat.insert("end", "\n")
-        self.chat.image_create("end", image=photo)
-        self.chat.insert("end", "\n")
+        self._ensure_newline()
+        self.chat.image_create("end", image=photo, padx=10, pady=4)
+        self.chat.insert("end", "\n", tag)
 
     def _stream_token(self, piece, tag="assistant"):
         self.chat.config(state="normal")
@@ -1836,26 +2324,36 @@ class ChatApp:
         """「思考を表示」に合わせて、思考タグの折りたたみを切り替える。"""
         self.chat.tag_config("thought", elide=not self.show_thought_var.get())
 
-    def _append_system(self, text):
+    def _append_system(self, text, error=False):
+        """案内・警告をチャット欄に小さく出す (会話の履歴には含めない)。"""
         self.chat.config(state="normal")
-        self.chat.insert("end", f"\n[システム] {text}\n", "system")
+        self._ensure_newline()
+        self.chat.insert("end", f"{text}\n", "error" if error else "system")
         self.chat.config(state="disabled")
         self.chat.see("end")
 
     def _finish_generation(self, status):
         self.generating = False
         self._stop_event.clear()
-        self.send_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
+        self._set_busy(False)
+        self.send_btn.config(text="送信", command=self.on_send, state="normal")
         self._refresh_regen_button()
-        usage = self.engine.context_usage()
-        if usage:
-            used, total = usage
-            status = f"{status} / コンテキスト {used}/{total} ({used * 100 // total}%)"
         self.status_var.set(status)
+        self._refresh_context_usage()
         self.chat.config(state="normal")
         self.chat.insert("end", "\n")
         self.chat.config(state="disabled")
+
+    def _refresh_context_usage(self):
+        """ステータスバー右端のコンテキスト使用量。"""
+        usage = self.engine.context_usage()
+        if not usage:
+            self.ctx_var.set("")
+            return
+        used, total = usage
+        percent = used * 100 // total if total else 0
+        self.ctx_var.set(f"コンテキスト {used:,} / {total:,} ({percent}%)")
+        self.ctx_label.config(style="StateWarn.TLabel" if percent >= 85 else "Muted.TLabel")
 
 
 def main():
