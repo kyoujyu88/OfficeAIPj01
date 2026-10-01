@@ -1,6 +1,6 @@
 # 引き継ぎメモ
 
-最終更新: 2026-10-01 / 回答のファイル保存（ブランチ `ccr-41acd84f-feyasi`）を反映
+最終更新: 2026-10-01 / Excel / Word 出力（ブランチ `ccr-41acd84f-feyasi`）を反映
 
 次のセッションが背景を読み直さずに作業を再開できるよう、**経緯と判断理由**を残す。
 使い方そのものは `README.md` にあるので、ここでは「なぜそうなっているか」を中心に書く。
@@ -95,7 +95,8 @@ Tkinter 製の GUI で、`llama-cpp-python` 経由で GGUF モデルを推論す
 | 画像が 2 枚と解釈される問題の修正 | #15 |
 | モデルフォルダの設定ファイル保存と UI 選択 | #16 |
 | UI の整理（詳細設定の折りたたみ、会話一覧の刷新、ショートカット、ステータスバー、文字サイズ） | #18 |
-| 回答のファイル保存（回答全体 / コードブロック単体、CSV は BOM 付き） | 本ブランチ |
+| 回答のファイル保存（回答全体 / コードブロック単体、CSV は BOM 付き） | #19 |
+| Excel / Word 出力（JSON スキーマで出力を縛る、Markdown の回答からの変換） | 本ブランチ |
 
 ---
 
@@ -277,6 +278,19 @@ xvfb-run -a -s "-screen 0 1200x780x24" /usr/bin/python3.12 drive.py
 
 日本語 UI フォント（Yu Gothic UI 等）はコンテナに無いため、見た目は実機と多少異なる。
 
+### 書き出したファイルの検証
+
+- openpyxl / python-docx は 3.12 に `pip install --user --break-system-packages` で入れて読み戻す
+- 自前で組んだ .xlsx が Office で開けるかは **LibreOffice で変換して確認**する。
+  `libreoffice-core` だけでは開けないので `apt-get install -y --no-install-recommends libreoffice-calc libreoffice-writer`。
+  `HOME` を書き込める場所にし、`LANG=C.UTF-8` にしないと日本語のシート名で出力ファイル名が化けて失われる
+
+```bash
+HOME=/tmp/lo LANG=C.UTF-8 soffice --headless --norestore \
+  --convert-to "csv:Text - txt - csv (StarCalc):44,34,76,1,,0,false,true,false,false,false,-1" \
+  --outdir out t.xlsx      # 全シートを CSV に書き出す
+```
+
 ### スタブの作り方
 
 ```python
@@ -403,15 +417,33 @@ for attr in ("ttk", "scrolledtext", "messagebox", "filedialog"):
 
 1. **回答を保存（実装済み）** — `on_save_answer`。モデルはコードブロックで中身を出すだけで、
    書き込みはアプリが行い、保存先は必ず人が選ぶ。ツール呼び出しの解析が不要なので確実
-2. **形式を強制した出力**（未着手）— JSON スキーマで出力を縛り、アプリが openpyxl /
-   python-docx で Excel・Word に変換する。モデルにバイナリ形式を書かせるより崩れない
+2. **形式を強制した出力（実装済み）** — 出力形式「Excel 表」「Word 文書」。
+   JSON スキーマ（`TABLE_SCHEMA` / `DOCUMENT_SCHEMA`）で出力を縛り、アプリが .xlsx / .docx に変換する。
+   「回答を保存」からも、Markdown の回答（表・見出し・箇条書き）を Excel / Word にできる
 3. **書き込みツール**（未着手）— 上記パーサを作ったうえで `write_file` を持たせる。
    実行前に内容とパスを確認ダイアログで見せること
 
 1 の設計判断:
 - CSV / TSV は `utf-8-sig`（BOM 付き）で書く。日本語版 Excel は BOM の無い CSV を CP932 として読み化けるため
 - 閉じていないコードブロック（max_tokens で途中終了）は不完全なので候補に出さない
-- 選択画面の既定は「最初のコードブロック」。ブロックがあるなら、それを保存したいことが多いため
+- 選択画面の既定は「Markdown の表があれば Excel、無ければ最初のコードブロック」。
+  `` ```csv `` で頼まれた回答は CSV のまま保存したいことが多いので、CSV ブロックだけなら Excel を既定にしない
+
+2 の設計判断:
+- **`response_format` は Gemma4ChatHandler でも効く（0.3.33 のソースで確認）。**
+  `MTMDChatHandler.__call__` が `_grammar_for_response_format` でスキーマを GBNF に変換しており、
+  `Gemma4ChatHandler` は `__call__` を上書きしていない。mmproj なし（チャットテンプレート経路）も同様。
+  スキーマを 0.3.33 の `json_schema_to_gbnf` に通して変換できることも確認済み
+- **セルは文字列だけのスキーマにした。** 数値・文字列の混在 (anyOf) は文法が複雑になり小型モデルが迷う。
+  数値化はアプリ側（`_excel_value`）で行い、先頭 0 の番号は文字列のまま残す
+- **スキーマだけでは各項目の意味が伝わらない**ので、`STRUCTURED_INSTRUCTIONS` をシステムプロンプトに足す
+- **思考モードは無効にする。** 文法で縛ると `<|channel>thought` を出せず、思考と JSON がぶつかる
+- **Excel は標準ライブラリ（zipfile）で書く。** 利用者の環境（Library.txt）に openpyxl が無く、
+  オフラインで追加導入も難しいため。最小構成の Office Open XML（インライン文字列、太字見出し、
+  見出し行の固定、列幅）を自前で組む。Word は導入済みの python-docx を使う
+- **会話履歴には JSON ではなく Markdown を残す。** 続けて修正を頼めるようにし、「回答を保存」でも再利用できる。
+  画面上の JSON は `answer_start` マークから末尾までを消して Markdown に置き換えている
+- 途中で止めた・JSON として読めない（max_tokens 不足など）場合はファイルを作らず、理由を表示する
 
 ### 9.4 Markdown / コードブロックの装飾表示（優先度: 低）
 
