@@ -15,6 +15,7 @@
       * Ctrl・Shift + クリックで複数選択してまとめて削除
   - サンプリング等は折りたたみ式の詳細設定パネルに収納 (開閉状態は保存)
   - キーボードショートカット (Esc で停止、Ctrl+N 新規、Ctrl +/- で文字サイズ 等)
+  - 回答をファイルに保存 (回答全体を .md、またはコードブロック単体を言語に合った拡張子で)
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
@@ -191,6 +192,25 @@ COLORS = {
     "ok": "#1a7f37",
     "warn": "#9a6700",
 }
+
+# ---- 回答の保存 ----------------------------------------------------------
+# コードブロックの言語名 -> 保存するときの拡張子。ここに無い言語は .txt
+CODE_BLOCK_SUFFIXES = {
+    "csv": ".csv", "tsv": ".tsv", "json": ".json", "jsonl": ".jsonl",
+    "markdown": ".md", "md": ".md", "text": ".txt", "txt": ".txt", "plaintext": ".txt",
+    "html": ".html", "xml": ".xml", "yaml": ".yaml", "yml": ".yaml", "ini": ".ini",
+    "toml": ".toml", "sql": ".sql", "python": ".py", "py": ".py",
+    "javascript": ".js", "js": ".js", "typescript": ".ts", "ts": ".ts",
+    "java": ".java", "c": ".c", "cpp": ".cpp", "c++": ".cpp", "csharp": ".cs", "cs": ".cs",
+    "vb": ".vb", "vba": ".bas", "bat": ".bat", "batch": ".bat", "cmd": ".bat",
+    "powershell": ".ps1", "ps1": ".ps1", "pwsh": ".ps1", "bash": ".sh", "sh": ".sh",
+    "shell": ".sh", "css": ".css", "mermaid": ".mmd",
+}
+# Excel で開いたときに文字化けしないよう BOM 付き UTF-8 で書く拡張子
+# (日本語版 Excel は BOM の無い CSV を CP932 として読む)
+BOM_SUFFIXES = {".csv", ".tsv"}
+# 選択画面で各コードブロックの先頭を見せる行数
+SAVE_PREVIEW_LINES = 3
 
 # ---- カメラ --------------------------------------------------------------
 # 使うカメラの番号 (内蔵カメラは 0。外付けを使う場合は 1 以降)
@@ -720,6 +740,44 @@ def plain_content(content, with_images=False):
     return "\n".join(t for t in texts if t)
 
 
+def extract_code_blocks(text):
+    """Markdown のコードブロック (```lang ... ```) を [(言語, 中身), ...] で返す。
+
+    閉じていないブロック (max_tokens で途中終了した等) は不完全なので含めない。
+    ``` の前のインデント (箇条書きの中のブロック) は許す。
+    """
+    blocks = []
+    lang = None
+    body = []
+    fence = ""
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if lang is None:
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                fence = stripped[:3]
+                lang = stripped[3:].strip().split()[0].lower() if stripped[3:].strip() else ""
+                body = []
+        elif stripped == fence:
+            blocks.append((lang, "\n".join(body) + "\n"))
+            lang = None
+        else:
+            body.append(line)
+    return blocks
+
+
+def suffix_for_language(lang):
+    """コードブロックの言語名から保存用の拡張子を決める。"""
+    return CODE_BLOCK_SUFFIXES.get((lang or "").lower(), ".txt")
+
+
+def save_text_file(path, text):
+    """テキストを保存する。CSV / TSV は Excel 向けに BOM 付きで書く。"""
+    path = Path(path)
+    encoding = "utf-8-sig" if path.suffix.lower() in BOM_SUFFIXES else "utf-8"
+    path.write_text(text, encoding=encoding)
+    return path
+
+
 # --------------------------------------------------------------------------
 # 会話履歴ストア (1 会話 = 1 JSON ファイル)
 # --------------------------------------------------------------------------
@@ -1022,6 +1080,65 @@ class CameraWindow:
         self.window.destroy()
 
 
+class SaveChoiceDialog:
+    """回答のうち、どこを保存するかを選ぶ小さなダイアログ。
+
+    candidates: [(見出し, プレビュー文字列), ...]。選ばれた添字 (取り消しなら None) を返す。
+    """
+
+    def __init__(self, parent, candidates):
+        self.result = None
+        self.window = tk.Toplevel(parent)
+        self.window.title("回答をファイルに保存")
+        self.window.transient(parent)
+        self.window.resizable(False, False)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        body = ttk.Frame(self.window, padding=14)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="保存する内容を選んでください").pack(anchor="w", pady=(0, 8))
+        self.choice = tk.IntVar(value=1 if len(candidates) > 1 else 0)
+        for i, (label, preview) in enumerate(candidates):
+            ttk.Radiobutton(body, text=label, variable=self.choice, value=i).pack(anchor="w")
+            if preview:
+                ttk.Label(body, text=preview, style="Muted.TLabel", justify="left").pack(
+                    anchor="w", padx=(24, 0), pady=(0, 6)
+                )
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="キャンセル", command=self.cancel).pack(side="right")
+        ttk.Button(
+            buttons, text="保存先を選ぶ...", style="Accent.TButton", command=self.ok
+        ).pack(side="right", padx=(0, 6))
+        self.window.bind("<Return>", lambda e: self.ok())
+        self.window.bind("<Escape>", lambda e: self.cancel())
+        self._center_on(parent)
+
+    def _center_on(self, parent):
+        """親ウィンドウの中央に出す (既定だと画面の左上に出ることがある)。"""
+        self.window.update_idletasks()
+        w, h = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
+        x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - h) // 3
+        self.window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def show(self):
+        """閉じられるまで待って結果を返す (モーダル)。"""
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.wait_window()
+        return self.result
+
+    def ok(self):
+        self.result = self.choice.get()
+        self.window.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.window.destroy()
+
+
 class ChatApp:
     def __init__(self, root):
         self.root = root
@@ -1155,6 +1272,7 @@ class ChatApp:
         self.pdf_as_image_var = tk.BooleanVar(value=False)
         self.show_settings_var = tk.BooleanVar(value=False)
         self.font_size_var = tk.IntVar(value=DEFAULT_FONT_SIZE)
+        self.save_dir_var = tk.StringVar(value="")      # 最後に回答を保存したフォルダ
         self.search_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="準備完了")
         self.model_state_var = tk.StringVar(value="● 未読み込み")
@@ -1179,6 +1297,8 @@ class ChatApp:
         chat_menu.add_command(label="再生成", accelerator="Ctrl+R", command=self.on_regenerate)
         chat_menu.add_command(label="最後の回答をコピー", accelerator="Ctrl+Shift+C",
                               command=self.copy_last_answer)
+        chat_menu.add_command(label="最後の回答をファイルに保存...", accelerator="Ctrl+S",
+                              command=self.on_save_answer)
         chat_menu.add_separator()
         chat_menu.add_checkbutton(label="思考モード", variable=self.thinking_var)
         menubar.add_cascade(label="チャット", menu=chat_menu)
@@ -1356,6 +1476,7 @@ class ChatApp:
         self.chat_menu.add_command(label="すべて選択", accelerator="Ctrl+A", command=self.select_all_chat)
         self.chat_menu.add_separator()
         self.chat_menu.add_command(label="最後の回答をコピー", command=self.copy_last_answer)
+        self.chat_menu.add_command(label="最後の回答をファイルに保存...", command=self.on_save_answer)
         chat.bind(self._context_click(), self._show_chat_menu)
         chat.bind("<Control-a>", lambda e: self.select_all_chat() or "break")
 
@@ -1370,6 +1491,10 @@ class ChatApp:
             tools, text="↻ 再生成", width=-8, command=self.on_regenerate, state="disabled"
         )
         self.regen_btn.pack(side="right")
+        self.save_btn = ttk.Button(
+            tools, text="回答を保存...", width=-8, command=self.on_save_answer, state="disabled"
+        )
+        self.save_btn.pack(side="right", padx=(0, 4))
         self.attach_btn = ttk.Button(tools, text="ファイル添付...", width=-8, command=self.on_attach)
         self.attach_btn.pack(side="left")
         self.camera_btn = ttk.Button(tools, text="カメラ...", width=-8, command=self.on_camera)
@@ -1420,6 +1545,7 @@ class ChatApp:
             "<Control-n>": self.on_new_chat,
             "<Control-o>": self.on_attach,
             "<Control-r>": self.on_regenerate,
+            "<Control-s>": self.on_save_answer,
             "<Control-Shift-C>": self.copy_last_answer,  # CapsLock 中の Ctrl+C と区別するため Shift を明示
             "<Escape>": self.on_stop,
             "<Control-plus>": lambda: self._zoom(1),
@@ -1586,6 +1712,7 @@ class ChatApp:
             "model": (self.model_var, str),
             "show_settings": (self.show_settings_var, bool),
             "font_size": (self.font_size_var, int),
+            "save_dir": (self.save_dir_var, str),
         }
 
     def _load_settings(self):
@@ -1727,9 +1854,71 @@ class ChatApp:
         self._refresh_regen_button()
 
     def _refresh_regen_button(self):
-        """再生成できる応答があるときだけボタンを有効にする。"""
+        """再生成・保存できる応答があるときだけボタンを有効にする。"""
         enabled = not self.generating and any(m["role"] == "assistant" for m in self.history)
-        self.regen_btn.config(state="normal" if enabled else "disabled")
+        state = "normal" if enabled else "disabled"
+        self.regen_btn.config(state=state)
+        self.save_btn.config(state=state)
+
+    # ---- 回答の保存 ------------------------------------------------------
+    def _last_answer(self):
+        last = next((m for m in reversed(self.history) if m["role"] == "assistant"), None)
+        return plain_content(last["content"]) if last else None
+
+    def on_save_answer(self):
+        """直近の回答をファイルに保存する。
+
+        回答にコードブロックがあれば、全体かブロック単体かを選べる。
+        ブロック単体なら言語名から拡張子を決める (```csv なら .csv)。
+        書き込みはアプリが行い、場所は必ず人が選ぶ (モデルに任意の場所へ書かせない)。
+        """
+        if self.generating:
+            return
+        answer = self._last_answer()
+        if not answer:
+            self.status_var.set("保存できる回答がありません")
+            return
+
+        # 候補: [(見出し, プレビュー, 中身, 拡張子)]。先頭は回答全体 (Markdown)
+        candidates = [("回答全体 (.md)", "", answer.rstrip() + "\n", ".md")]
+        for i, (lang, body) in enumerate(extract_code_blocks(answer), 1):
+            lines = body.splitlines()
+            preview = "\n".join(line[:60] for line in lines[:SAVE_PREVIEW_LINES])
+            if len(lines) > SAVE_PREVIEW_LINES:
+                preview += "\n…"
+            suffix = suffix_for_language(lang)
+            label = f"コードブロック {i}: {lang or 'テキスト'} ({len(lines)} 行, {suffix})"
+            candidates.append((label, preview, body, suffix))
+
+        index = 0
+        if len(candidates) > 1:
+            index = SaveChoiceDialog(self.root, [(c[0], c[1]) for c in candidates]).show()
+            if index is None:
+                return
+        _, _, text, suffix = candidates[index]
+
+        initial_dir = self.save_dir_var.get()
+        if not initial_dir or not Path(initial_dir).is_dir():
+            initial_dir = str(Path.home())
+        chosen = filedialog.asksaveasfilename(
+            title="回答をファイルに保存",
+            initialdir=initial_dir,
+            initialfile=time.strftime("answer_%Y%m%d_%H%M%S") + suffix,
+            defaultextension=suffix,
+            filetypes=[(f"{suffix} ファイル", f"*{suffix}"), ("すべてのファイル", "*.*")],
+        )
+        if not chosen:
+            return
+        try:
+            path = save_text_file(chosen, text)
+        except Exception as e:
+            log.exception("[保存] 失敗: %s", chosen)
+            self._append_system(f"保存できませんでした: {e}", error=True)
+            return
+        self.save_dir_var.set(str(path.parent))
+        log.info("[保存] %s (%d 文字)", path, len(text))
+        self._append_system(f"保存しました: {path}")
+        self.status_var.set(f"保存しました: {path.name}")
 
     def on_new_chat(self):
         if self.generating:
