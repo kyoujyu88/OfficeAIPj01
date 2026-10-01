@@ -17,6 +17,7 @@
   - キーボードショートカット (Esc で停止、Ctrl+N 新規、Ctrl +/- で文字サイズ 等)
   - 回答をファイルに保存 (回答全体を .md / Word、表を Excel、コードブロック単体を言語に合った拡張子で)
   - 出力形式「Excel 表」「Word 文書」: モデルの出力を JSON スキーマで縛り、アプリが .xlsx / .docx に変換
+  - スキル: 用途ごとの指示・出力形式・思考モード・ひな形を保存しておき、選ぶだけで切り替える
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
@@ -78,6 +79,9 @@ SESSIONS_DIR = Path(__file__).resolve().parent / "chat_sessions"
 # アプリ設定 (システムプロンプト・サンプリング値など) の保存先。
 # 会話ごとの設定は各会話の JSON 側に持つ。こちらは「新しいチャットの初期値」。
 SETTINGS_PATH = Path(__file__).resolve().parent / "chat_settings.json"
+
+# スキル (用途ごとの指示のセット) の保存先。「スキルの設定」画面で編集する。
+SKILLS_PATH = Path(__file__).resolve().parent / "chat_skills.json"
 
 # マルチモーダル投影ファイル。未指定ならモデルフォルダから mmproj*.gguf を探す。
 MMPROJ_OVERRIDE = os.environ.get("LLM_MMPROJ")
@@ -1271,6 +1275,123 @@ def safe_filename(title, fallback="answer"):
 
 
 # --------------------------------------------------------------------------
+# スキル (用途ごとに保存しておく指示のセット)
+# --------------------------------------------------------------------------
+# 1 スキル = {"name", "description", "instructions", "output", "thinking", "template"}
+#   instructions: システムプロンプトに足す指示
+#   output:       出力形式 (OUTPUT_MODES の表示名。"チャット" / "Excel 表" / "Word 文書")
+#   thinking:     思考モード ("そのまま" / "オン" / "オフ")
+#   template:     選んだときに入力欄へ入れるひな形 (空なら何もしない)
+NO_SKILL = "（なし）"
+THINKING_CHOICES = ("そのまま", "オン", "オフ")
+
+# スキルファイルが無いときの初期スキル (事務作業でよく使うもの)
+DEFAULT_SKILLS = [
+    {
+        "name": "議事録まとめ",
+        "description": "会議のメモや文字起こしから議事録を作る",
+        "instructions": (
+            "入力された会議のメモや文字起こしから議事録を作成してください。"
+            "見出しは「日時・参加者」「議題」「決定事項」「宿題（担当・期限）」「次回予定」とします。"
+            "メモに書かれていない項目は「記載なし」とし、推測で補わないでください。"
+        ),
+        "output": "チャット",
+        "thinking": "そのまま",
+        "template": "会議のメモ:\n",
+    },
+    {
+        "name": "メール作成",
+        "description": "要件からビジネスメールの文面を作る",
+        "instructions": (
+            "丁寧なビジネスメールの文面を作成してください。件名と本文を分け、"
+            "本文は宛名、挨拶、要件、結びの順に書いてください。簡潔にまとめてください。"
+        ),
+        "output": "チャット",
+        "thinking": "オフ",
+        "template": "宛先:\n用件:\n",
+    },
+    {
+        "name": "文章の校正",
+        "description": "誤字脱字や不自然な表現を直す",
+        "instructions": (
+            "入力された文章の誤字脱字と、不自然な表現を直してください。"
+            "最初に修正後の全文を示し、そのあとに主な修正点を箇条書きで説明してください。"
+            "意味が変わる書き換えはしないでください。"
+        ),
+        "output": "チャット",
+        "thinking": "オフ",
+        "template": "",
+    },
+    {
+        "name": "要約",
+        "description": "文章や添付ファイルの要点をまとめる",
+        "instructions": (
+            "入力された文章や添付ファイルの要点を、3〜5 行の箇条書きでまとめてください。"
+            "数字・日付・固有名詞は正確に残してください。"
+        ),
+        "output": "チャット",
+        "thinking": "オフ",
+        "template": "",
+    },
+    {
+        "name": "表に整理 (Excel)",
+        "description": "内容を表に整理して Excel で保存する",
+        "instructions": "入力された内容を表に整理してください。列は内容に合わせて決めてください。",
+        "output": "Excel 表",
+        "thinking": "そのまま",
+        "template": "",
+    },
+]
+
+
+def normalize_skill(data):
+    """読み込んだスキルを正しい形にそろえる。名前が無ければ None。"""
+    if not isinstance(data, dict):
+        return None
+    name = str(data.get("name") or "").strip()
+    if not name or name == NO_SKILL:
+        return None
+    output = data.get("output")
+    thinking = data.get("thinking")
+    return {
+        "name": name,
+        "description": str(data.get("description") or "").strip(),
+        "instructions": str(data.get("instructions") or "").strip(),
+        "output": output if output in OUTPUT_MODES else "チャット",
+        "thinking": thinking if thinking in THINKING_CHOICES else "そのまま",
+        "template": str(data.get("template") or ""),
+    }
+
+
+def load_skills(path=None):
+    """スキルを読む。ファイルが無ければ初期スキル、壊れていれば初期スキル (警告を出す)。"""
+    path = Path(path or SKILLS_PATH)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return [dict(s) for s in DEFAULT_SKILLS]
+    except Exception as e:
+        log.warning("[スキル] 読み込みに失敗しました (%s) -> 初期スキルを使います", e)
+        return [dict(s) for s in DEFAULT_SKILLS]
+    skills, seen = [], set()
+    for item in raw.get("skills", []) if isinstance(raw, dict) else []:
+        skill = normalize_skill(item)
+        if skill and skill["name"] not in seen:     # 同じ名前は先にあるものを使う
+            seen.add(skill["name"])
+            skills.append(skill)
+    return skills
+
+
+def save_skills(skills, path=None):
+    path = Path(path or SKILLS_PATH)
+    path.write_text(
+        json.dumps({"skills": skills}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    log.info("[スキル] 保存: %s (%d 件)", path, len(skills))
+    return path
+
+
+# --------------------------------------------------------------------------
 # 会話履歴ストア (1 会話 = 1 JSON ファイル)
 # --------------------------------------------------------------------------
 class SessionStore:
@@ -1689,6 +1810,15 @@ class CameraWindow:
         self.window.destroy()
 
 
+def center_on(window, parent):
+    """小窓を親ウィンドウの中央に出す (既定だと画面の左上に出ることがある)。"""
+    window.update_idletasks()
+    w, h = window.winfo_reqwidth(), window.winfo_reqheight()
+    x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - h) // 3
+    window.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+
 class SaveChoiceDialog:
     """回答のうち、どこを保存するかを選ぶ小さなダイアログ。
 
@@ -1722,15 +1852,7 @@ class SaveChoiceDialog:
         ).pack(side="right", padx=(0, 6))
         self.window.bind("<Return>", lambda e: self.ok())
         self.window.bind("<Escape>", lambda e: self.cancel())
-        self._center_on(parent)
-
-    def _center_on(self, parent):
-        """親ウィンドウの中央に出す (既定だと画面の左上に出ることがある)。"""
-        self.window.update_idletasks()
-        w, h = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
-        x = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - h) // 3
-        self.window.geometry(f"+{max(0, x)}+{max(0, y)}")
+        center_on(self.window, parent)
 
     def show(self):
         """閉じられるまで待って結果を返す (モーダル)。"""
@@ -1746,6 +1868,252 @@ class SaveChoiceDialog:
     def cancel(self):
         self.result = None
         self.window.destroy()
+
+
+class SkillEditor:
+    """スキルの追加・編集・削除を行う画面 (モーダル)。
+
+    編集は手元のコピーに対して行い、「保存」で初めてファイルへ書く。
+    「キャンセル」なら何も変わらない。
+    """
+
+    FIELDS_HINT = (
+        "指示はシステムプロンプトに足されます。出力形式と思考モードは、"
+        "スキルを選んだときに切り替わります。ひな形は入力欄が空のときに入ります。"
+    )
+
+    def __init__(self, parent, skills, selected=None):
+        self.skills = [dict(s) for s in skills]
+        self.result = None          # 保存したらスキルの一覧、キャンセルなら None
+        self.current = None         # 編集中の添字
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("スキルの設定")
+        self.window.transient(parent)
+        self.window.minsize(640, 460)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+
+        # 左: 一覧と操作
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="y")
+        ttk.Label(left, text="スキル", style="Muted.TLabel").pack(anchor="w")
+        self.listbox = tk.Listbox(left, width=22, height=14, exportselection=False,
+                                  activestyle="none")
+        self.listbox.pack(fill="y", expand=True, pady=(2, 6))
+        self.listbox.bind("<<ListboxSelect>>", lambda e: self._on_select())
+        buttons = ttk.Frame(left)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="新規", width=-5, command=self.add).pack(side="left")
+        ttk.Button(buttons, text="複製", width=-5, command=self.duplicate).pack(side="left", padx=4)
+        ttk.Button(buttons, text="削除", width=-5, command=self.delete).pack(side="left")
+        order = ttk.Frame(left)
+        order.pack(fill="x", pady=(4, 0))
+        ttk.Button(order, text="▲ 上へ", width=-6, command=lambda: self.move(-1)).pack(side="left")
+        ttk.Button(order, text="▼ 下へ", width=-6, command=lambda: self.move(1)).pack(
+            side="left", padx=4
+        )
+
+        # 右: 編集欄
+        form = ttk.Frame(body, padding=(14, 0, 0, 0))
+        form.pack(side="left", fill="both", expand=True)
+        form.columnconfigure(1, weight=1)
+        self.name_var = tk.StringVar()
+        self.desc_var = tk.StringVar()
+        self.output_var = tk.StringVar(value="チャット")
+        self.thinking_var = tk.StringVar(value="そのまま")
+
+        ttk.Label(form, text="名前").grid(row=0, column=0, sticky="w", pady=2)
+        self.name_entry = ttk.Entry(form, textvariable=self.name_var)
+        self.name_entry.grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Label(form, text="説明").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(form, textvariable=self.desc_var).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Label(form, text="指示").grid(row=2, column=0, sticky="nw", pady=2)
+        self.instructions = tk.Text(form, height=8, wrap="word", undo=True)
+        self.instructions.grid(row=2, column=1, sticky="nsew", pady=2)
+        form.rowconfigure(2, weight=1)
+
+        opts = ttk.Frame(form)
+        opts.grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(opts, text="出力形式").pack(side="left")
+        ttk.Combobox(opts, textvariable=self.output_var, values=list(OUTPUT_MODES),
+                     state="readonly", width=9).pack(side="left", padx=(4, 16))
+        ttk.Label(opts, text="思考モード").pack(side="left")
+        ttk.Combobox(opts, textvariable=self.thinking_var, values=THINKING_CHOICES,
+                     state="readonly", width=7).pack(side="left", padx=(4, 0))
+
+        ttk.Label(form, text="ひな形").grid(row=4, column=0, sticky="nw", pady=2)
+        self.template = tk.Text(form, height=3, wrap="word", undo=True)
+        self.template.grid(row=4, column=1, sticky="ew", pady=2)
+        ttk.Label(form, text=self.FIELDS_HINT, style="Muted.TLabel", wraplength=380,
+                  justify="left").grid(row=5, column=1, sticky="w", pady=(4, 0))
+
+        self.error_var = tk.StringVar()
+        ttk.Label(form, textvariable=self.error_var, foreground=COLORS["error"]).grid(
+            row=6, column=1, sticky="w"
+        )
+
+        bottom = ttk.Frame(self.window, padding=(12, 0, 12, 12))
+        bottom.pack(fill="x")
+        ttk.Button(bottom, text="キャンセル", command=self.cancel).pack(side="right")
+        ttk.Button(bottom, text="保存", style="Accent.TButton", command=self.save).pack(
+            side="right", padx=(0, 6)
+        )
+        self.window.bind("<Escape>", lambda e: self.cancel())
+
+        self._fill_list()
+        names = [s["name"] for s in self.skills]
+        self._select(names.index(selected) if selected in names else 0)
+        center_on(self.window, parent)
+
+    # ---- 一覧と編集欄の受け渡し -----------------------------------------
+    def _fill_list(self):
+        self.listbox.delete(0, "end")
+        for skill in self.skills:
+            self.listbox.insert("end", skill["name"] or "(名前なし)")
+
+    def _select(self, index):
+        if not self.skills:
+            self.current = None
+            self._load_form(None)
+            return
+        index = max(0, min(index, len(self.skills) - 1))
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(index)
+        self.listbox.see(index)
+        self.current = index
+        self._load_form(self.skills[index])
+
+    def _load_form(self, skill):
+        skill = skill or {"name": "", "description": "", "instructions": "",
+                          "output": "チャット", "thinking": "そのまま", "template": ""}
+        self.name_var.set(skill["name"])
+        self.desc_var.set(skill["description"])
+        self.output_var.set(skill["output"])
+        self.thinking_var.set(skill["thinking"])
+        for widget, key in ((self.instructions, "instructions"), (self.template, "template")):
+            widget.delete("1.0", "end")
+            widget.insert("1.0", skill[key])
+            widget.edit_reset()
+        self.error_var.set("")
+
+    def _store_form(self):
+        """編集欄の内容を手元のコピーへ戻す。一覧の表示名も更新する。"""
+        if self.current is None:
+            return
+        skill = self.skills[self.current]
+        skill.update(
+            name=self.name_var.get().strip(),
+            description=self.desc_var.get().strip(),
+            instructions=self.instructions.get("1.0", "end-1c").strip(),
+            output=self.output_var.get(),
+            thinking=self.thinking_var.get(),
+            template=self.template.get("1.0", "end-1c"),
+        )
+        self.listbox.delete(self.current)
+        self.listbox.insert(self.current, skill["name"] or "(名前なし)")
+        self.listbox.selection_set(self.current)
+
+    def _on_select(self):
+        selected = self.listbox.curselection()
+        if not selected or selected[0] == self.current:
+            return
+        self._store_form()
+        self._select(selected[0])
+
+    # ---- 操作 ------------------------------------------------------------
+    def _unique_name(self, base):
+        names = {s["name"] for s in self.skills}
+        name, n = base, 2
+        while name in names:
+            name = f"{base} ({n})"
+            n += 1
+        return name
+
+    def add(self):
+        self._store_form()
+        self.skills.append({"name": self._unique_name("新しいスキル"), "description": "",
+                            "instructions": "", "output": "チャット", "thinking": "そのまま",
+                            "template": ""})
+        self._fill_list()
+        self._select(len(self.skills) - 1)
+        self.name_entry.focus_set()
+        self.name_entry.select_range(0, "end")
+
+    def duplicate(self):
+        if self.current is None:
+            return
+        self._store_form()
+        copy = dict(self.skills[self.current])
+        copy["name"] = self._unique_name(f"{copy['name']} のコピー")
+        self.skills.insert(self.current + 1, copy)
+        self._fill_list()
+        self._select(self.current + 1)
+
+    def delete(self):
+        if self.current is None:
+            return
+        name = self.skills[self.current]["name"]
+        if not messagebox.askyesno("スキルの削除", f"「{name}」を削除しますか？",
+                                   parent=self.window):
+            return
+        del self.skills[self.current]
+        index = self.current
+        self.current = None
+        self._fill_list()
+        self._select(index)
+
+    def move(self, step):
+        if self.current is None:
+            return
+        target = self.current + step
+        if not 0 <= target < len(self.skills):
+            return
+        self._store_form()
+        self.skills[self.current], self.skills[target] = self.skills[target], self.skills[self.current]
+        self._fill_list()
+        self._select(target)
+
+    def _validate(self):
+        """名前の空欄・重複を調べる。問題があればその項目を選んでメッセージを返す。"""
+        seen = set()
+        for i, skill in enumerate(self.skills):
+            name = skill["name"]
+            problem = None
+            if not name:
+                problem = "名前を入力してください"
+            elif name == NO_SKILL:
+                problem = f"「{NO_SKILL}」は名前に使えません"
+            elif name in seen:
+                problem = f"「{name}」という名前が重複しています"
+            if problem:
+                self._select(i)
+                return problem
+            seen.add(name)
+        return None
+
+    def save(self):
+        self._store_form()
+        problem = self._validate()
+        if problem:
+            self.error_var.set(problem)
+            self.name_entry.focus_set()
+            return
+        self.result = [normalize_skill(s) for s in self.skills]
+        self.window.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.window.destroy()
+
+    def show(self):
+        """閉じられるまで待って結果を返す (モーダル)。"""
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.wait_window()
+        return self.result
 
 
 class ChatApp:
@@ -1777,6 +2145,8 @@ class ChatApp:
             log.info("[設定] LLM_MODELS_DIR が指定されているため、保存済みのフォルダは使いません")
         elif saved_dir:
             set_models_dir(saved_dir)
+
+        self.skills = load_skills()    # スキル (用途ごとの指示のセット)
 
         self._build_ui()
         self._load_settings()
@@ -1887,6 +2257,9 @@ class ChatApp:
         self.save_dir_var = tk.StringVar(value="")      # 最後に回答を保存したフォルダ
         # 回答の形式。Excel 表 / Word 文書を選ぶと、モデルの出力を JSON に縛って書き出す
         self.output_mode_var = tk.StringVar(value="チャット")
+        # 使うスキルの名前 (NO_SKILL なら使わない) と、その説明
+        self.skill_var = tk.StringVar(value=NO_SKILL)
+        self.skill_desc_var = tk.StringVar(value="")
         self.search_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="準備完了")
         self.model_state_var = tk.StringVar(value="● 未読み込み")
@@ -1913,6 +2286,8 @@ class ChatApp:
                               command=self.copy_last_answer)
         chat_menu.add_command(label="最後の回答をファイルに保存...", accelerator="Ctrl+S",
                               command=self.on_save_answer)
+        chat_menu.add_separator()
+        chat_menu.add_command(label="スキルの設定...", command=self.on_edit_skills)
         chat_menu.add_separator()
         chat_menu.add_checkbutton(label="思考モード", variable=self.thinking_var)
         chat_menu.add_separator()
@@ -1958,6 +2333,25 @@ class ChatApp:
         ttk.Button(
             parent, text="＋ 新規チャット", style="Accent.TButton", command=self.on_new_chat
         ).pack(fill="x")
+
+        # スキル: 選ぶと指示・出力形式・思考モード・ひな形がまとめて切り替わる
+        ttk.Label(parent, text="スキル", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
+        skill_row = ttk.Frame(parent)
+        skill_row.pack(fill="x")
+        ttk.Button(skill_row, text="設定...", width=-5, command=self.on_edit_skills).pack(
+            side="right", padx=(4, 0)
+        )
+        self.skill_combo = ttk.Combobox(
+            skill_row, textvariable=self.skill_var, state="readonly", width=16,
+        )
+        self.skill_combo.pack(side="left", fill="x", expand=True)
+        self.skill_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_skill())
+        self.skill_desc_label = ttk.Label(
+            parent, textvariable=self.skill_desc_var, style="Muted.TLabel",
+            wraplength=220, justify="left",
+        )
+        self.skill_desc_label.pack(anchor="w", pady=(2, 0))
+        self._refresh_skill_choices()
 
         ttk.Label(parent, text="会話履歴", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
         # 表示用の変数と、絞り込みに使う本当の値 (search_var) を分けておく
@@ -2378,6 +2772,7 @@ class ChatApp:
             "show_settings": (self.show_settings_var, bool),
             "font_size": (self.font_size_var, int),
             "save_dir": (self.save_dir_var, str),
+            "skill": (self.skill_var, str),
         }
 
     def _load_settings(self):
@@ -2400,6 +2795,10 @@ class ChatApp:
         self._apply_thought_visibility()
         self._apply_settings_visibility()
         self._set_font_size(self.font_size_var.get())
+        # 前回のスキル (消されていれば使わない)。出力形式などは保存済みの値のまま
+        if self._current_skill() is None:
+            self.skill_var.set(NO_SKILL)
+        self._apply_skill(announce=False, template=False, modes=False)
         if data:
             log.info("[設定] 復元: %s", SETTINGS_PATH)
 
@@ -2448,6 +2847,7 @@ class ChatApp:
             "model": self.engine.model_name,
             "system_prompt": self.system_var.get(),
             "thinking": bool(self.thinking_var.get()),
+            "skill": self.skill_var.get(),
             # 画像は base64 のまま保存すると JSON が肥大するため、本文だけを残す。
             # (会話を再開すると画像はモデルに渡らず、[添付画像: 名前] の記述だけが残る)
             "messages": [
@@ -2673,6 +3073,10 @@ class ChatApp:
         self.current_created = data.get("created", time.time())
         self._dirty = False
         self.system_var.set(data.get("system_prompt", ""))
+        # 会話で使っていたスキルに戻す (出力形式もスキルに合わせる)。思考モードは会話の値を優先
+        skill_name = data.get("skill") or NO_SKILL
+        self.skill_var.set(skill_name if self._skill_by_name(skill_name) else NO_SKILL)
+        self._apply_skill(announce=False, template=False)
         self.thinking_var.set(bool(data.get("thinking", False)))
         self._repaint_chat()
         self._refresh_sidebar()
@@ -2974,6 +3378,66 @@ class ChatApp:
         self.status_var.set("停止中 ...")
         log.info("[UI] 停止要求")
 
+    # ---- スキル ----------------------------------------------------------
+    def _skill_by_name(self, name):
+        return next((s for s in self.skills if s["name"] == name), None)
+
+    def _current_skill(self):
+        return self._skill_by_name(self.skill_var.get())
+
+    def _refresh_skill_choices(self):
+        self.skill_combo["values"] = [NO_SKILL] + [s["name"] for s in self.skills]
+
+    def _apply_skill(self, announce=True, template=True, modes=True):
+        """選んだスキルを反映する。
+
+        modes: 出力形式と思考モードもスキルに合わせるか (起動時の復元では保存値を優先)
+        template: 入力欄が空ならひな形を入れるか
+        """
+        skill = self._current_skill()
+        self.skill_desc_var.set(skill["description"] if skill else "")
+        if skill is None:
+            if modes and announce:
+                self.output_mode_var.set("チャット")
+                self._append_system("スキルを使いません")
+            return
+        if modes:
+            self.output_mode_var.set(skill["output"])
+            if skill["thinking"] != "そのまま":
+                self.thinking_var.set(skill["thinking"] == "オン")
+        if template and skill["template"] and not self._input_text():
+            self._hide_placeholder()
+            self.input.insert("1.0", skill["template"])
+            self.input.mark_set("insert", "end-1c")
+        if announce:
+            details = [f"出力: {self.output_mode_var.get()}"]
+            if skill["thinking"] != "そのまま":
+                details.append(f"思考モード: {skill['thinking']}")
+            self._append_system(f"スキル「{skill['name']}」を使います ({'、'.join(details)})")
+            self.input.focus_set()
+        log.info("[スキル] 選択: %s", skill["name"])
+
+    def on_edit_skills(self):
+        """スキルの設定画面を開く。保存したらファイルへ書いて、一覧を更新する。"""
+        if self.generating:
+            return
+        result = SkillEditor(self.root, self.skills, selected=self.skill_var.get()).show()
+        if result is None:
+            return
+        try:
+            save_skills(result)
+        except Exception as e:
+            log.exception("[スキル] 保存に失敗")
+            self._append_system(f"スキルを保存できませんでした: {e}", error=True)
+            return
+        self.skills = result
+        self._refresh_skill_choices()
+        if self._current_skill() is None:
+            self.skill_var.set(NO_SKILL)
+        # 選んでいるスキルの内容が変わった可能性があるので、説明と出力形式を合わせ直す
+        self._apply_skill(announce=False, template=False)
+        self.status_var.set(f"スキルを保存しました ({len(result)} 件)")
+
     def _output_kind(self):
         """今の出力形式 ("table" / "document"、通常のチャットなら None)。"""
         return OUTPUT_MODES.get(self.output_mode_var.get())
@@ -2994,12 +3458,15 @@ class ChatApp:
         Excel / Word 出力のときは形式の説明を足し、思考モードは使わない
         (出力を JSON の文法で縛るため、思考チャネルの記号を出せなくなる)。
         """
-        text = self.system_var.get().strip()
+        skill = self._current_skill()
+        parts = [
+            self.system_var.get().strip(),
+            skill["instructions"] if skill else "",
+            STRUCTURED_INSTRUCTIONS.get(self._output_kind(), ""),
+        ]
+        text = "\n\n".join(p for p in parts if p)
         kind = self._output_kind()
-        if kind:
-            instruction = STRUCTURED_INSTRUCTIONS[kind]
-            text = f"{text}\n\n{instruction}" if text else instruction
-        elif self.thinking_var.get():
+        if not kind and self.thinking_var.get():
             text = f"{THINK_TOKEN}\n{text}" if text else THINK_TOKEN
         return {"role": "system", "content": text} if text else None
 

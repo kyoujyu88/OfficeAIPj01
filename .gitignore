@@ -14,3 +14,6 @@ chat_settings.json
 .venv/
 venv/
 .env
+
+# スキル (利用者ごとの設定)
+chat_skills.json
