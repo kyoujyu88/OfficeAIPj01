@@ -22,6 +22,7 @@
   - 会話は JSON ファイルとして自動保存 (chat_sessions/ フォルダ)
   - ファイル添付 (画像 / PDF / Word / Excel / テキスト系)
   - カメラからの取り込み (OpenCV。プレビューを見ながら撮影して添付)
+  - クリップボードからの添付 (スクリーンショット・コピーしたファイル・文字。Ctrl+V / 「貼り付け」)
   - ターミナルに動作状況 (状態遷移・性能) をデバッグ出力
 
 備考:
@@ -1720,6 +1721,33 @@ class LLMEngine:
 # --------------------------------------------------------------------------
 # GUI 本体
 # --------------------------------------------------------------------------
+def grab_clipboard():
+    """クリップボードの画像かファイルを取り出す (Pillow の ImageGrab を使う)。
+
+    戻り値: ("files", [Path, ...]) / ("image", PNG のバイト列) / (None, None)
+    Windows ではエクスプローラーでコピーしたファイルと、スクリーンショット等の画像を読める。
+    文字はここでは扱わない (Tk の clipboard_get で読む)。
+    """
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        raise RuntimeError("クリップボードの画像を読むには Pillow が必要です (pip install pillow)")
+    try:
+        data = ImageGrab.grabclipboard()
+    except Exception as e:      # Linux で xclip / wl-paste が無い場合など
+        raise RuntimeError(f"クリップボードを読めません ({e})")
+    if data is None:
+        return None, None
+    if isinstance(data, list):
+        return "files", [Path(p) for p in data]
+    image = data
+    if image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+        image = image.convert("RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return "image", buffer.getvalue()
+
+
 class CameraWindow:
     """カメラのプレビューを出し、撮影した画像を添付として渡す小窓。
 
@@ -2527,6 +2555,7 @@ class ChatApp:
         file_menu.add_command(label="新規チャット", accelerator="Ctrl+N", command=self.on_new_chat)
         file_menu.add_separator()
         file_menu.add_command(label="ファイルを添付...", accelerator="Ctrl+O", command=self.on_attach)
+        file_menu.add_command(label="クリップボードから添付", command=self.on_paste_attach)
         file_menu.add_command(label="カメラから取り込む...", command=self.on_camera)
         file_menu.add_separator()
         file_menu.add_command(label="モデルフォルダを選ぶ...", command=self.on_choose_models_dir)
@@ -2793,11 +2822,13 @@ class ChatApp:
             tools, text="回答を保存", width=-8, command=self.on_save_answer, state="disabled"
         )
         self.save_btn.pack(side="right", padx=(0, 4))
-        self.attach_btn = ttk.Button(tools, text="ファイル添付", width=-8, command=self.on_attach)
+        self.attach_btn = ttk.Button(tools, text="ファイル添付", width=-4, command=self.on_attach)
         self.attach_btn.pack(side="left")
-        self.camera_btn = ttk.Button(tools, text="カメラ", width=-8, command=self.on_camera)
+        self.camera_btn = ttk.Button(tools, text="カメラ", width=-4, command=self.on_camera)
         self.camera_btn.pack(side="left", padx=(4, 0))
-        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
+        self.paste_btn = ttk.Button(tools, text="貼り付け", width=-4, command=self.on_paste_attach)
+        self.paste_btn.pack(side="left", padx=(4, 0))
+        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
         # 狭いときは右側から切れるので、よく変えるものほど左に置く
         # (「思考を表示」は一度決めたら変えないことが多いので、表示メニューにだけ置く)
         ttk.Label(tools, text="出力").pack(side="left")
@@ -2807,7 +2838,7 @@ class ChatApp:
         )
         self.output_combo.pack(side="left", padx=(4, 0))
         self.output_combo.bind("<<ComboboxSelected>>", lambda e: self._on_output_mode())
-        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
+        ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
         ttk.Checkbutton(tools, text="思考モード", variable=self.thinking_var).pack(side="left")
 
         # 添付一覧 (添付があるときだけ表示する)
@@ -2838,6 +2869,9 @@ class ChatApp:
         # Enter で送信 / Shift+Enter で改行
         self.input.bind("<Return>", lambda e: self.on_send())
         self.input.bind("<Shift-Return>", self._insert_newline)
+        # Ctrl+V: 文字は今までどおり貼り付け、スクリーンショットやコピーしたファイルは添付する
+        self.input.bind("<Control-v>", self._on_input_paste)
+        self.input.bind("<Control-V>", self._on_input_paste)
         self.input.bind("<FocusIn>", lambda e: self._hide_placeholder())
         self.input.bind("<FocusOut>", lambda e: self._show_placeholder())
         self._show_placeholder()
@@ -2931,7 +2965,10 @@ class ChatApp:
         """入力欄が空なら案内文を出す。"""
         if self._placeholder_on or self.input.get("1.0", "end-1c"):
             return
-        self.input.insert("1.0", "メッセージを入力  (Enter で送信 / Shift+Enter で改行)", "placeholder")
+        self.input.insert(
+            "1.0", "メッセージを入力  (Enter で送信 / Shift+Enter で改行 / Ctrl+V で画像も添付)",
+            "placeholder",
+        )
         self._placeholder_on = True
 
     def _hide_placeholder(self):
@@ -3457,14 +3494,94 @@ class ChatApp:
                 ("すべてのファイル", "*.*"),
             ],
         )
-        for raw in paths:
-            path = Path(raw)
+        self._add_paths(Path(raw) for raw in paths)
+
+    def _add_paths(self, paths):
+        """ファイルを添付に加える。読めないものは理由を表示して飛ばす。追加した件数を返す。"""
+        added = 0
+        for path in paths:
             try:
-                self.attachments.extend(self._make_attachments(path))
+                if path.is_dir():
+                    raise RuntimeError("フォルダは添付できません")
+                entries = self._make_attachments(path)
             except Exception as e:
                 log.warning("[添付] 追加できません: %s (%s)", path.name, e)
                 self._append_system(f"添付できません: {path.name} ({e})")
+                continue
+            self.attachments.extend(entries)
+            added += len(entries)
         self._refresh_attachments()
+        return added
+
+    # ---- クリップボードからの添付 ----------------------------------------
+    def _clipboard_text(self):
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:             # 文字が入っていない
+            return ""
+
+    def _attach_clipboard_image(self, data):
+        name = time.strftime("clipboard_%Y%m%d_%H%M%S.png")
+        if not self.engine.vision:
+            self._append_system(
+                "このモデル構成では画像を渡せません (mmproj 未検出)。添付はできますが送信時に外されます"
+            )
+        self.attachments.append(image_attachment(name, data))
+        self._refresh_attachments()
+        log.info("[添付] クリップボードの画像: %s (%.1f KB)", name, len(data) / 1024)
+        self.status_var.set(f"クリップボードの画像を添付しました: {name}")
+
+    def on_paste_attach(self):
+        """「貼り付け」ボタン: クリップボードの中身を添付する。
+
+        優先順: コピーしたファイル > 文字 (テキストとして添付) > 画像。
+        Excel のセルをコピーすると文字と画像の両方が入るため、文字を画像より優先する。
+        """
+        if self.generating:
+            return
+        try:
+            kind, payload = grab_clipboard()
+        except RuntimeError as e:
+            kind, payload, error = None, None, str(e)
+        else:
+            error = None
+        if kind == "files":
+            added = self._add_paths(payload)
+            if added:
+                self.status_var.set(f"クリップボードのファイルを添付しました ({added} 件)")
+            return
+        text = self._clipboard_text().strip()
+        if text:
+            if len(text) > MAX_DOC_CHARS:
+                omitted = len(text) - MAX_DOC_CHARS
+                text = text[:MAX_DOC_CHARS] + f"\n…(以降 {omitted} 文字を省略)"
+            name = time.strftime("clipboard_%H%M%S.txt")
+            self.attachments.append({"kind": "document", "name": name, "text": text})
+            self._refresh_attachments()
+            log.info("[添付] クリップボードの文字: %d 文字", len(text))
+            self.status_var.set(f"クリップボードの文字を添付しました ({len(text)} 文字)")
+            return
+        if kind == "image":
+            self._attach_clipboard_image(payload)
+            return
+        self._append_system(error or "クリップボードに添付できるものがありません", error=bool(error))
+
+    def _on_input_paste(self, event=None):
+        """入力欄の Ctrl+V: 文字があれば普通に貼り付け、無ければ画像・ファイルを添付する。"""
+        if self.generating or self._clipboard_text():
+            return None                 # Tk の既定の貼り付けに任せる
+        try:
+            kind, payload = grab_clipboard()
+        except RuntimeError as e:
+            log.debug("[添付] クリップボードを読めません: %s", e)
+            return None
+        if kind == "files":
+            self._add_paths(payload)
+            return "break"
+        if kind == "image":
+            self._attach_clipboard_image(payload)
+            return "break"
+        return None
 
     def _make_attachments(self, path):
         """パスから添付エントリの一覧を作る。読めない場合は例外を送出。
