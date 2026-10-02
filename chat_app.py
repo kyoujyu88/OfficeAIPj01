@@ -37,7 +37,7 @@
 
 実行:
   python chat_app.py
-  # モデルの置き場所は UI の「フォルダ...」で選べば chat_settings.json に保存される。
+  # モデルの置き場所は UI の「フォルダ」で選べば chat_settings.json に保存される。
   # 一時的に別の場所を使いたい場合のみ環境変数で上書きする:
   LLM_MODELS_DIR=/path/to/models python chat_app.py
   # mmproj を明示指定する場合:
@@ -71,7 +71,7 @@ from tkinter import font as tkfont
 # --------------------------------------------------------------------------
 # モデル (.gguf) を置いているフォルダ。環境変数 LLM_MODELS_DIR で上書き可。
 # 優先順位は 環境変数 > 設定ファイル (chat_settings.json) > カレントディレクトリ。
-# 設定ファイルの値は起動時に読み込み、UI の「フォルダ...」で変更できる。
+# 設定ファイルの値は起動時に読み込み、UI の「フォルダ」で変更できる。
 MODELS_DIR_FROM_ENV = bool(os.environ.get("LLM_MODELS_DIR"))
 MODELS_DIR = Path(os.environ.get("LLM_MODELS_DIR", ".")).expanduser()
 
@@ -1857,7 +1857,7 @@ class SaveChoiceDialog:
         buttons.pack(fill="x", pady=(10, 0))
         ttk.Button(buttons, text="キャンセル", command=self.cancel).pack(side="right")
         ttk.Button(
-            buttons, text="保存先を選ぶ...", style="Accent.TButton", command=self.ok
+            buttons, text="保存先を選ぶ", style="Accent.TButton", command=self.ok
         ).pack(side="right", padx=(0, 6))
         self.window.bind("<Return>", lambda e: self.ok())
         self.window.bind("<Escape>", lambda e: self.cancel())
@@ -2167,7 +2167,7 @@ class RagWindow:
         for r, (label, var, title) in enumerate(rows):
             ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=2)
             ttk.Entry(body, textvariable=var).grid(row=r, column=1, sticky="ew", pady=2, padx=(8, 4))
-            ttk.Button(body, text="参照...", width=-6,
+            ttk.Button(body, text="参照", width=-6,
                        command=lambda v=var, t=title: self._choose_dir(v, t)).grid(row=r, column=2)
         ttk.Label(
             body, style="Muted.TLabel", justify="left", wraplength=560,
@@ -2596,7 +2596,7 @@ class ChatApp:
         ttk.Label(parent, text="スキル", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
         skill_row = ttk.Frame(parent)
         skill_row.pack(fill="x")
-        ttk.Button(skill_row, text="設定...", width=-5, command=self.on_edit_skills).pack(
+        ttk.Button(skill_row, text="設定", width=-5, command=self.on_edit_skills).pack(
             side="right", padx=(4, 0)
         )
         self.skill_combo = ttk.Combobox(
@@ -2615,7 +2615,7 @@ class ChatApp:
         ttk.Label(parent, text="資料検索", style="Muted.TLabel").pack(anchor="w", pady=(12, 2))
         rag_row = ttk.Frame(parent)
         rag_row.pack(fill="x")
-        ttk.Button(rag_row, text="設定...", width=-5, command=self.on_rag_settings).pack(
+        ttk.Button(rag_row, text="設定", width=-5, command=self.on_rag_settings).pack(
             side="right", padx=(4, 0)
         )
         ttk.Checkbutton(
@@ -2679,7 +2679,7 @@ class ChatApp:
         # ttk ボタンの既定幅 (11 文字) は広すぎるので、負の値 (= 最小幅) で詰める
         self.load_btn = ttk.Button(top, text="読み込み", width=-8, command=self.on_load)
         self.load_btn.grid(row=0, column=2, padx=(4, 0))
-        ttk.Button(top, text="フォルダ...", width=-8, command=self.on_choose_models_dir).grid(
+        ttk.Button(top, text="フォルダ", width=-8, command=self.on_choose_models_dir).grid(
             row=0, column=3, padx=(4, 0)
         )
         self.settings_btn = ttk.Button(top, width=-7, command=self.toggle_settings)
@@ -2790,12 +2790,12 @@ class ChatApp:
         )
         self.regen_btn.pack(side="right")
         self.save_btn = ttk.Button(
-            tools, text="回答を保存...", width=-8, command=self.on_save_answer, state="disabled"
+            tools, text="回答を保存", width=-8, command=self.on_save_answer, state="disabled"
         )
         self.save_btn.pack(side="right", padx=(0, 4))
-        self.attach_btn = ttk.Button(tools, text="ファイル添付...", width=-8, command=self.on_attach)
+        self.attach_btn = ttk.Button(tools, text="ファイル添付", width=-8, command=self.on_attach)
         self.attach_btn.pack(side="left")
-        self.camera_btn = ttk.Button(tools, text="カメラ...", width=-8, command=self.on_camera)
+        self.camera_btn = ttk.Button(tools, text="カメラ", width=-8, command=self.on_camera)
         self.camera_btn.pack(side="left", padx=(4, 0))
         ttk.Separator(tools, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
         # 狭いときは右側から切れるので、よく変えるものほど左に置く
@@ -3738,7 +3738,7 @@ class ChatApp:
         if index is None:
             self.rag_status_var.set("使えません (numpy が必要です)")
         elif not index.ready:
-            self.rag_status_var.set("索引がありません (「設定...」から作成)")
+            self.rag_status_var.set("索引がありません (「設定」から作成)")
         else:
             self.rag_status_var.set(
                 f"{len(index.meta.get('files', {}))} ファイル / {len(index.chunks)} チャンク"
@@ -3749,9 +3749,9 @@ class ChatApp:
             self._append_system("資料検索を使いません")
             return
         if self.rag_index is None or not self.rag_index.ready:
-            self._append_system("資料検索の索引がありません。「設定...」から作成してください")
+            self._append_system("資料検索の索引がありません。「設定」から作成してください")
         elif not self.rag_model_dir_var.get().strip():
-            self._append_system("埋め込みモデルが未設定です。「設定...」から選んでください")
+            self._append_system("埋め込みモデルが未設定です。「設定」から選んでください")
         else:
             self._append_system("資料検索を使います (回答の後に出典を表示します)")
 
