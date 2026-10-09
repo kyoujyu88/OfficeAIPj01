@@ -2181,7 +2181,7 @@ class RagWindow:
         self.window = tk.Toplevel(app.root)
         self.window.title("資料検索 (RAG) の設定")
         self.window.transient(app.root)
-        self.window.minsize(640, 520)
+        self.window.minsize(680, 620)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         body = ttk.Frame(self.window, padding=12)
@@ -2212,17 +2212,39 @@ class RagWindow:
         self.build_btn = ttk.Button(index_box, text="索引を作成・更新", style="Accent.TButton",
                                     command=self.build)
         self.build_btn.grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.cancel_btn = ttk.Button(index_box, text="中止", width=-5, command=self.cancel.set,
+        self.cancel_btn = ttk.Button(index_box, text="中止", width=-5, command=self.on_cancel,
                                      state="disabled")
         self.cancel_btn.grid(row=1, column=1, sticky="w", pady=(6, 0), padx=(6, 0))
+        self.progress = ttk.Progressbar(index_box, mode="determinate", maximum=1,
+                                        style="Accent.Horizontal.TProgressbar")
+        self.progress.grid(row=1, column=2, sticky="ew", pady=(6, 0), padx=(10, 0))
+        index_box.columnconfigure(2, weight=1)
+        index_box.columnconfigure(0, weight=0)
         self.progress_var = tk.StringVar(value="変更のあったファイルだけを読み直します")
         ttk.Label(index_box, textvariable=self.progress_var, style="Muted.TLabel").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
 
+        # 操作の記録 (何をしているか・何が起きたかを時刻付きで残す)
+        log_box = ttk.LabelFrame(body, text="ログ", padding=8)
+        log_box.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+        log_box.columnconfigure(0, weight=1)
+        log_box.rowconfigure(0, weight=1)
+        self.log_text = scrolledtext.ScrolledText(log_box, height=8, wrap="char", state="disabled")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.tag_config("time", foreground=COLORS["muted"])
+        self.log_text.tag_config("warn", foreground=COLORS["error"])
+        self.log_text.tag_config("done", foreground=COLORS["ok"])
+        log_tools = ttk.Frame(log_box)
+        log_tools.grid(row=1, column=0, sticky="e", pady=(4, 0))
+        ttk.Button(log_tools, text="コピー", width=-6, command=self._copy_log).pack(side="left")
+        ttk.Button(log_tools, text="クリア", width=-6, command=self._clear_log).pack(
+            side="left", padx=(6, 0))
+
         test_box = ttk.LabelFrame(body, text="検索テスト (どの資料が見つかるかを確かめる)", padding=8)
-        test_box.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
+        test_box.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(10, 0))
         body.rowconfigure(4, weight=1)
+        body.rowconfigure(5, weight=1)
         test_box.columnconfigure(0, weight=1)
         test_box.rowconfigure(1, weight=1)
         self.query_var = tk.StringVar()
@@ -2231,7 +2253,7 @@ class RagWindow:
         query.bind("<Return>", lambda e: self.search_test())
         self.search_btn = ttk.Button(test_box, text="検索", width=-5, command=self.search_test)
         self.search_btn.grid(row=0, column=1, padx=(6, 0))
-        self.results = scrolledtext.ScrolledText(test_box, height=10, wrap="word", state="disabled")
+        self.results = scrolledtext.ScrolledText(test_box, height=7, wrap="word", state="disabled")
         self.results.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
         self.results.tag_config("head", foreground=COLORS["assistant_head"])
 
@@ -2239,9 +2261,46 @@ class RagWindow:
         bottom.pack(fill="x")
         ttk.Button(bottom, text="閉じる", command=self.close).pack(side="right")
 
+        self._build_started = None      # 索引作成の開始時刻 (残り時間の見積もり用)
         self._refresh_summary()
+        self._log("設定画面を開きました")
+        self._log(f"索引: {self.summary_var.get()}")
+        for label, var, _ in rows:
+            self._log(f"{label}: {var.get().strip() or '(未設定)'}")
         center_on(self.window, app.root)
         self.window.after(self.POLL_MS, self._poll)
+
+    # ---- ログ ------------------------------------------------------------
+    def _log(self, message, tag=None, echo=True):
+        """ログ欄に時刻付きで 1 行足す (UI スレッドから)。
+
+        echo=True なら同じ内容をロガーにも出す (rag 側で既にロガーへ出したものは False)。
+        """
+        if echo:
+            log.info("[RAG画面] %s", message)
+        if tag is None and ("読めません" in message or "エラー" in message
+                            or "ありません" in message or "中止" in message):
+            tag = "warn"
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", time.strftime("%H:%M:%S "), "time")
+        self.log_text.insert("end", message + "\n", tag)
+        self.log_text.config(state="disabled")
+        self.log_text.see("end")
+
+    def _copy_log(self):
+        self.window.clipboard_clear()
+        self.window.clipboard_append(self.log_text.get("1.0", "end-1c"))
+        self.progress_var.set("ログをクリップボードにコピーしました")
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+    def _status(self, message, tag=None, echo=True):
+        """状態の 1 行とログの両方に出す。"""
+        self.progress_var.set(message)
+        self._log(message, tag, echo)
 
     # ---- 小物 ------------------------------------------------------------
     def _choose_dir(self, var, title):
@@ -2249,6 +2308,23 @@ class RagWindow:
                                          parent=self.window)
         if chosen:
             var.set(chosen)
+            self._log(f"{title.replace('を選択', '')}を変更: {chosen}")
+            if var is self.app.rag_docs_dir_var:
+                self._log_folder_contents(chosen)
+
+    def _log_folder_contents(self, folder):
+        """資料フォルダを選んだときに、索引の対象になるファイル数をすぐ見せる。"""
+        try:
+            import rag
+
+            count = sum(1 for _ in rag.iter_documents(Path(folder)))
+        except Exception as e:
+            self._log(f"資料フォルダを調べられません: {e}")
+            return
+        if count:
+            self._log(f"索引の対象になるファイル: {count} 件 (「索引を作成・更新」で取り込みます)")
+        else:
+            self._log("対象のファイルがありません (PDF / Word / Excel / テキストを置いてください)")
 
     def _refresh_summary(self):
         index = self.app.rag_index
@@ -2257,6 +2333,7 @@ class RagWindow:
 
     def _set_busy(self, busy):
         self.busy = busy
+        self.window.config(cursor="watch" if busy else "")
         state = "disabled" if busy else "normal"
         self.build_btn.config(state=state)
         self.search_btn.config(state=state)
@@ -2284,26 +2361,40 @@ class RagWindow:
     def build(self):
         problem = self._check_inputs(need_docs=True)
         if problem:
-            self.progress_var.set(problem)
+            self._status(problem, "warn")
             return
         self.cancel.clear()
         self._set_busy(True)
-        self.progress_var.set("埋め込みモデルを読み込んでいます ...")
+        self.progress.config(value=0, maximum=1)
+        self._build_started = None
+        self._log("―― 索引の作成・更新を開始 ――", "done")
+        self.progress_var.set("準備中")
         threading.Thread(target=self._build_worker, name="rag-build", daemon=True,
                          args=(self.app.rag_docs_dir_var.get().strip(),
                                self.app.rag_model_dir_var.get().strip())).start()
 
+    def _load_embedder(self, model_dir):
+        """(ワーカースレッド) 埋め込みモデルを用意する。初回の読み込みは時間がかかるので知らせる。"""
+        if self.app._embedder is not None and self.app._embedder_key == model_dir:
+            return self.app._rag_embedder(model_dir)
+        self.queue.put(("status", f"埋め込みモデルを読み込んでいます: {Path(model_dir).name} "
+                                  "(初回は数秒〜数十秒かかります)"))
+        embedder = self.app._rag_embedder(model_dir)
+        seconds = getattr(embedder, "load_seconds", None)
+        self.queue.put(("log", "埋め込みモデルを読み込みました"
+                               + (f" ({seconds:.1f} 秒)" if seconds is not None else "")))
+        return embedder
+
     def _build_worker(self, docs_dir, model_dir):
         try:
-            embedder = self.app._rag_embedder(model_dir)
+            embedder = self._load_embedder(model_dir)
             with self.app._rag_lock:
-                t0 = time.time()
                 stats = self.app.rag_index.build(
                     docs_dir, embedder, lambda p: extract_document_text(p, max_chars=None),
-                    progress=lambda n, total, name: self.queue.put(("progress", f"[{n}/{total}] {name}")),
+                    progress=lambda n, total, name: self.queue.put(("progress", (n, total, name))),
                     cancel=self.cancel,
+                    report=lambda message: self.queue.put(("log", message)),
                 )
-                stats["seconds"] = time.time() - t0
             self.queue.put(("built", stats))
         except Exception as e:
             log.exception("[RAG] 索引の作成に失敗")
@@ -2314,22 +2405,23 @@ class RagWindow:
         query = self.query_var.get().strip()
         problem = self._check_inputs(need_docs=False)
         if not query or problem:
-            self.progress_var.set(problem or "検索する文を入力してください")
+            self._status(problem or "検索する文を入力してください", "warn")
             return
         if not self.app.rag_index.ready:
-            self.progress_var.set("先に索引を作成してください")
+            self._status("索引がありません。先に索引を作成してください", "warn")
             return
         self._set_busy(True)
-        self.progress_var.set("検索中 ...")
+        self._status(f"検索テスト: 「{query}」")
         threading.Thread(target=self._search_worker, name="rag-test", daemon=True,
                          args=(query, self.app.rag_model_dir_var.get().strip())).start()
 
     def _search_worker(self, query, model_dir):
         try:
-            embedder = self.app._rag_embedder(model_dir)
+            embedder = self._load_embedder(model_dir)
+            t0 = time.time()
             with self.app._rag_lock:
                 hits = self.app.rag_index.search(query, embedder, top_k=5, max_chars=10 ** 9)
-            self.queue.put(("searched", hits))
+            self.queue.put(("searched", (hits, time.time() - t0)))
         except Exception as e:
             log.exception("[RAG] 検索テストに失敗")
             self.queue.put(("failed", str(e)))
@@ -2342,13 +2434,20 @@ class RagWindow:
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == "progress":
-                    self.progress_var.set(payload)
+                    self._show_progress(*payload)
+                elif kind == "log":             # rag 側でロガーにも出している
+                    self._log(payload, echo=False)
+                elif kind == "status":
+                    self._status(payload, echo=False)
                 elif kind == "built":
                     self._set_busy(False)
                     s = payload
-                    text = (("中止しました (それまでの索引はそのまま残ります)" if s["cancelled"] else
-                             f"完了 ({s['seconds']:.0f} 秒): 追加 {s['added']} / 更新 {s['updated']} / "
-                             f"削除 {s['removed']} / 変更なし {s['unchanged']}"))
+                    if s["cancelled"]:
+                        text = "中止しました (それまでの索引はそのまま残ります)"
+                    else:
+                        self.progress.config(value=self.progress.cget("maximum"))
+                        text = (f"完了 ({s['seconds']:.0f} 秒): 追加 {s['added']} / 更新 {s['updated']} / "
+                                f"削除 {s['removed']} / 変更なし {s['unchanged']}")
                     if s["failed"]:
                         text += f" / 読めないファイル {len(s['failed'])}"
                         self._show_results(
@@ -2356,26 +2455,53 @@ class RagWindow:
                             + [(f"・{name} ({reason})\n", None) for name, reason in s["failed"]]
                         )
                     self.progress_var.set(text)
+                    self._log(text, "warn" if s["cancelled"] or s["failed"] else "done")
                     self._refresh_summary()
                     self.app._refresh_rag_status()
                 elif kind == "searched":
                     self._set_busy(False)
-                    self.progress_var.set(f"{len(payload)} 件")
+                    hits, seconds = payload
+                    if hits:
+                        best = hits[0]
+                        text = (f"{len(hits)} 件見つかりました ({seconds:.2f} 秒)。"
+                                f"最上位 {best['score']:.3f}: {rag_source_label(best)}")
+                    else:
+                        text = f"見つかりませんでした ({seconds:.2f} 秒)"
+                    self._status(text, "done" if hits else "warn")
                     parts = []
-                    for hit in payload:
+                    for hit in hits:
                         parts.append((f"[{hit['no']}] {hit['score']:.3f}  {rag_source_label(hit)}\n", "head"))
                         parts.append((hit["text"] + "\n\n", None))
                     self._show_results(parts or [("見つかりませんでした", None)])
                 elif kind == "failed":
                     self._set_busy(False)
-                    self.progress_var.set(f"エラー: {payload}")
+                    self._status(f"エラー: {payload}", "warn")
         except queue.Empty:
             pass
         self.window.after(self.POLL_MS, self._poll)
 
+    def _show_progress(self, n, total, name):
+        """進み具合 (件数・経過時間・残りの見積もり) をプログレスバーと状態の行に出す。"""
+        now = time.time()
+        if self._build_started is None or n == 1:
+            self._build_started = now
+        self.progress.config(maximum=max(total, 1), value=n - 1)
+        elapsed = now - self._build_started
+        text = f"[{n}/{total}] {name}  経過 {elapsed:.0f} 秒"
+        if n > 3 and elapsed >= 5:
+            remaining = elapsed / (n - 1) * (total - n + 1)
+            text += f" / 残り約 {remaining:.0f} 秒"
+        self.progress_var.set(text)
+
+    def on_cancel(self):
+        self.cancel.set()
+        self.cancel_btn.config(state="disabled")
+        self._status("中止します (今のファイルが終わったところで止まります)", "warn")
+
     def close(self):
         if self.busy:
             self.cancel.set()           # 索引の作成は次のファイルの区切りで止まる
+            log.info("[RAG画面] 作業中に閉じたため中止します")
         self.app._refresh_rag_status()
         self.window.destroy()
 
@@ -2510,6 +2636,8 @@ class ChatApp:
         # 入力欄の中に出す案内文 (灰色の文字)
         self.style.configure("Hint.TEntry", foreground=COLORS["muted"])
         self.style.configure("Accent.TButton", font=self.fonts["ui_bold"])
+        # clam の進捗バーは地の色と見分けにくいので、進んだ部分を強調色にする
+        self.style.configure("Accent.Horizontal.TProgressbar", background=COLORS["accent"])
         for kind in ("ok", "warn", "error", "muted"):
             self.style.configure(f"State{kind.title()}.TLabel", foreground=COLORS[kind])
         # 行の高さは文字の高さに合わせる (固定値だと高 DPI や大きいフォントで文字が切れる)

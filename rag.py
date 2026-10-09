@@ -51,6 +51,9 @@ INDEXABLE_SUFFIXES = {
     ".yaml", ".yml", ".ini", ".xml", ".html", ".sql",
 }
 
+# ログに出す形式名
+_KIND_NAMES = {".pdf": "PDF", ".docx": "Word", ".xlsx": "Excel", ".xlsm": "Excel"}
+
 # 索引の形式。変えたら古い索引は作り直す
 INDEX_VERSION = 1
 
@@ -100,7 +103,8 @@ class Embedder:
             if "ruri" in self.name.lower() and "v3" in self.name.lower():
                 hint = " (Ruri v3 には transformers 4.48 以降が必要です: pip install -U transformers)"
             raise RuntimeError(f"埋め込みモデルを読み込めません: {e}{hint}") from e
-        log.info("[RAG] 埋め込みモデル読み込み完了: %.1f 秒", time.time() - t0)
+        self.load_seconds = time.time() - t0
+        log.info("[RAG] 埋め込みモデル読み込み完了: %.1f 秒", self.load_seconds)
 
     def _encode(self, texts):
         import numpy as np
@@ -254,18 +258,29 @@ class RagIndex:
                 f"(モデル: {self.meta.get('model', '?')}, 更新: {built})")
 
     # ---- 作成・差分更新 --------------------------------------------------
-    def build(self, docs_dir, embedder, extract_text, progress=None, cancel=None):
+    def build(self, docs_dir, embedder, extract_text, progress=None, cancel=None, report=None):
         """資料フォルダから索引を作る。前回から変わったファイルだけ読み直す。
 
         progress(処理済み数, 全体数, ファイル名) を呼ぶ。cancel (threading.Event) が
         立ったら途中でやめる (それまでの索引はそのまま残る)。
-        戻り値: {"added", "updated", "removed", "unchanged", "failed": [(名前, 理由)], "cancelled"}
+        report(文) には、何をしているかを人が読める形で逐一渡す (画面のログ欄用)。
+        同じ内容はロガーにも出す。
+        戻り値: {"added", "updated", "removed", "unchanged", "failed": [(名前, 理由)],
+                 "cancelled", "files", "chunks", "seconds"}
         """
         import numpy as np
 
+        def say(message, level=logging.INFO):
+            log.log(level, "[RAG] %s", message)
+            if report and level > logging.DEBUG:      # 変更なしのファイルは画面には出さない (件数は最後にまとめて出す)
+                report(message)
+
+        t_start = time.time()
         docs_dir = Path(docs_dir).resolve()
         if not docs_dir.is_dir():
             raise RuntimeError(f"資料フォルダが見つかりません: {docs_dir}")
+        say(f"資料フォルダ: {docs_dir}")
+        say(f"埋め込みモデル: {embedder.name}")
         self.load()
         # 資料フォルダやモデルが変わったら、ベクトルを使い回せないので全部作り直す
         reusable = (
@@ -273,6 +288,16 @@ class RagIndex:
             and self.meta.get("docs_dir") == str(docs_dir)
             and self.meta.get("model") == embedder.name
         )
+        if reusable:
+            say(f"前回の索引を使い回します ({len(self.meta.get('files', {}))} ファイル)。"
+                "変わったファイルだけ読み直します")
+        elif not self.ready:
+            say("索引を新しく作ります (初回)")
+        elif self.meta.get("model") != embedder.name:
+            say(f"埋め込みモデルが変わったため、全部作り直します "
+                f"({self.meta.get('model')} → {embedder.name})")
+        else:
+            say("資料フォルダが変わったため、全部作り直します")
         old_files = self.meta.get("files", {}) if reusable else {}
         old_by_file = {}
         if reusable:
@@ -280,13 +305,23 @@ class RagIndex:
                 old_by_file.setdefault(chunk["file"], []).append(i)
 
         paths = list(iter_documents(docs_dir))
+        kinds = {}
+        for path in paths:
+            kind = _KIND_NAMES.get(path.suffix.lower(), "テキスト")
+            kinds[kind] = kinds.get(kind, 0) + 1
+        breakdown = " / ".join(f"{k} {v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1]))
+        say(f"対象ファイル: {len(paths)} 件" + (f" ({breakdown})" if breakdown else ""))
+        if not paths:
+            say("対象のファイルがありません (PDF / Word / Excel / テキストを置いてください)",
+                logging.WARNING)
+
         new_chunks, new_vectors, files = [], [], {}
         stats = {"added": 0, "updated": 0, "removed": 0, "unchanged": 0, "failed": [],
                  "cancelled": False}
         for n, path in enumerate(paths, 1):
             if cancel is not None and cancel.is_set():
                 stats["cancelled"] = True
-                log.info("[RAG] 索引の作成を中止しました")
+                say(f"中止しました ({n - 1}/{len(paths)} 件まで処理。索引は前回のまま残ります)")
                 return stats
             rel = path.relative_to(docs_dir).as_posix()
             if progress:
@@ -299,7 +334,9 @@ class RagIndex:
                 new_vectors.append(self.vectors[ids])
                 files[rel] = old_files[rel]
                 stats["unchanged"] += 1
+                say(f"[{n}/{len(paths)}] 変更なし {rel}", logging.DEBUG)
                 continue
+            t_file = time.time()
             try:
                 pieces = [
                     {"file": rel, "location": loc, "text": chunk}
@@ -310,14 +347,20 @@ class RagIndex:
                     raise RuntimeError("本文がありません")
                 vectors = embedder.encode_documents(p["text"] for p in pieces)
             except Exception as e:
-                log.warning("[RAG] 読めないファイル: %s (%s)", rel, e)
                 stats["failed"].append((rel, str(e)))
+                say(f"[{n}/{len(paths)}] 読めません {rel}: {e}", logging.WARNING)
                 continue
             new_chunks.extend(pieces)
             new_vectors.append(vectors)
             files[rel] = {"signature": signature, "chunks": len(pieces)}
+            action = "更新" if rel in old_files else "追加"
             stats["updated" if rel in old_files else "added"] += 1
-        stats["removed"] = len(set(old_files) - set(files))
+            say(f"[{n}/{len(paths)}] {action} {rel} ({len(pieces)} チャンク, "
+                f"{time.time() - t_file:.1f} 秒)")
+        removed = sorted(set(old_files) - set(files))
+        stats["removed"] = len(removed)
+        for rel in removed:
+            say(f"索引から外しました (ファイルが無くなったため): {rel}")
 
         self.chunks = new_chunks
         self.vectors = (np.concatenate(new_vectors).astype("float32") if new_vectors
@@ -327,7 +370,11 @@ class RagIndex:
             "chunk_chars": CHUNK_CHARS, "built": time.time(), "files": files,
         }
         self.save()
-        log.info("[RAG] 索引を保存: %s (%s)", self.dir, stats)
+        stats.update(files=len(files), chunks=len(new_chunks), seconds=time.time() - t_start)
+        say(f"索引を保存しました: {len(files)} ファイル / {len(new_chunks)} チャンク "
+            f"(追加 {stats['added']} / 更新 {stats['updated']} / 削除 {stats['removed']} / "
+            f"変更なし {stats['unchanged']} / 読めない {len(stats['failed'])}, "
+            f"{stats['seconds']:.1f} 秒)")
         return stats
 
     # ---- 検索 --------------------------------------------------------------
@@ -447,14 +494,9 @@ def main(argv=None):
         def extract(path):
             return extract_document_text(path, max_chars=None)
 
-        def progress(n, total, name):
-            print(f"\r[{n}/{total}] {name[:60]:<60}", end="", flush=True)
-
-        t0 = time.time()
-        stats = index.build(docs_dir, embedder, extract, progress=progress,
-                            cancel=threading.Event())
-        print()
-        print(f"完了 ({time.time() - t0:.1f} 秒): 追加 {stats['added']} / 更新 {stats['updated']} / "
+        # 経過はロガー (画面) にファイル単位で出る
+        stats = index.build(docs_dir, embedder, extract, cancel=threading.Event())
+        print(f"完了 ({stats['seconds']:.1f} 秒): 追加 {stats['added']} / 更新 {stats['updated']} / "
               f"削除 {stats['removed']} / 変更なし {stats['unchanged']} / 失敗 {len(stats['failed'])}")
         for name, reason in stats["failed"]:
             print(f"  読めなかったファイル: {name} ({reason})")
